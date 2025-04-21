@@ -419,9 +419,21 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
     
     logger.info(f"데이터 형태: {data.shape}")
     
+    # 데이터 형태 확인 및 변환
+    if data.shape[1] == 2 and data.shape[2] > 1000:
+        # 필요한 변환: (samples, 2, width) -> (samples, width, 2)
+        data = np.transpose(data, (0, 2, 1))
+        logger.info(f"데이터 형태 변환 완료: {data.shape}")
+
     # 모델 설정
     diffusion = DiffusionModel(timesteps=timesteps, beta_schedule=beta_schedule)
-    input_shape = (data.shape[1], data.shape[2], 1)  # 채널 차원 추가
+    if len(data.shape) == 3:
+        input_shape = (data.shape[1], data.shape[2], 1)
+        data = np.expand_dims(data, axis=-1)
+    else:
+        input_shape = data.shape[1:]
+    
+    logger.info(f"입력 형태: {input_shape}")
     
     # 데이터를 올바른 형태로 변환 (채널 추가)
     data = np.expand_dims(data, axis=-1)
