@@ -1,3 +1,4 @@
+import concurrent
 from concurrent.futures import ThreadPoolExecutor
 import glob
 import platform
@@ -16,6 +17,11 @@ import wave
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# 혼합 정밀도 정책 설정 (Apple Silicon에 최적화)
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
+logger.info(f"정밀도 정책: {policy.name}")
 
 # 설정 값
 sample_size = 2048
@@ -107,24 +113,41 @@ class Data:
         logger.info(f'Loaded wave file: {path} (길이: {len(self.samples)})')
 
     def transform(self) -> list[np.ndarray]:    
+        """웨이블릿 변환 병렬 처리"""
         result = []
         segments = len(self.samples) // sample_size
-    
+        segments_list = []
+        
+        # 세그먼트 미리 준비
         for i in range(segments):
             segment = self.samples[i * sample_size: (i + 1) * sample_size]
-            # 세그먼트가 짧으면 건너뛰기
-            if len(segment) < sample_size:
-                continue
-                
-            # 웨이블릿 변환
-            cA, cD = pywt.dwt(segment, WAVELET_TYPE)
-            # 유효한 결과인지 확인
-            if np.any(np.isnan(cA)) or np.any(np.isnan(cD)):
-                continue
-                
-            two_axis_vector = [cA, cD]
-            result.append(np.array(two_axis_vector))
-    
+            if len(segment) == sample_size:  # 세그먼트가 짧으면 건너뛰기
+                segments_list.append(segment)
+        
+        def process_segment(segment):
+            try:
+                # 웨이블릿 변환
+                cA, cD = pywt.dwt(segment, WAVELET_TYPE)
+                # 유효한 결과인지 확인
+                if np.any(np.isnan(cA)) or np.any(np.isnan(cD)):
+                    return None
+                return np.array([cA, cD])
+            except Exception as e:
+                logger.error(f"세그먼트 처리 중 오류 발생: {str(e)}")
+                return None
+        
+        # CPU 코어 수에 따라 워커 수 조정
+        num_workers = min(32, os.cpu_count() or 4)
+        
+        # 병렬 처리
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # map 대신 submit/as_completed 사용하여 결과 즉시 처리
+            futures = [executor.submit(process_segment, segment) for segment in segments_list]
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(segments_list), desc="웨이블릿 변환"):
+                res = future.result()
+                if res is not None:
+                    result.append(res)
+        
         return result
 
 def load_data_parallel(folder: str, max_files=MAX_FILES):
@@ -193,12 +216,19 @@ class DiffusionModel:
     
     def q_sample(self, x_0, t, noise=None):
         """forward 과정 (노이즈 추가)"""
+        # 입력 텐서 타입 확인 및 통일
+        dtype = x_0.dtype
+        
         if noise is None:
-            noise = tf.random.normal(shape=tf.shape(x_0), dtype=tf.float32)
+            noise = tf.random.normal(shape=tf.shape(x_0), dtype=dtype)
+        else:
+            # 노이즈도 동일한 데이터 타입으로 변환
+            noise = tf.cast(noise, dtype)
 
-        sqrt_alphas_cumprod_t = tf.cast(tf.gather(self.sqrt_alphas_cumprod, t), tf.float32)
+        # 알파 값들도 동일한 데이터 타입으로 변환
+        sqrt_alphas_cumprod_t = tf.cast(tf.gather(self.sqrt_alphas_cumprod, t), dtype)
         sqrt_one_minus_alphas_cumprod_t = tf.cast(
-            tf.gather(self.sqrt_one_minus_alphas_cumprod, t), tf.float32)
+            tf.gather(self.sqrt_one_minus_alphas_cumprod, t), dtype)
         
         # 차원 확장
         while len(sqrt_alphas_cumprod_t.shape) < len(x_0.shape):
@@ -235,18 +265,21 @@ class DiffusionModel:
         else:
             device = "/device:CPU:0"
         
-        with tf.device(device):  # GPU 사용 명시
+        with tf.device(device):
+            # 타입 변환
+            x = tf.cast(x, tf.float16)
+            
             # 예측된 노이즈 계산
             pred_noise = model([x, t], training=False)
             
-            # 알파 값들 준비
-            alpha = tf.constant(self.alphas[t_index], dtype=tf.float32)
-            alpha_cumprod = tf.constant(self.alphas_cumprod[t_index], dtype=tf.float32)
-            alpha_cumprod_prev = tf.constant(self.alphas_cumprod_prev[t_index], dtype=tf.float32)
-            beta = tf.constant(self.betas[t_index], dtype=tf.float32)
+            # 알파 값들 준비 (float16 사용)
+            alpha = tf.constant(self.alphas[t_index], dtype=tf.float16)
+            alpha_cumprod = tf.constant(self.alphas_cumprod[t_index], dtype=tf.float16)
+            alpha_cumprod_prev = tf.constant(self.alphas_cumprod_prev[t_index], dtype=tf.float16)
+            beta = tf.constant(self.betas[t_index], dtype=tf.float16)
             
             # 상수 준비
-            one = tf.constant(1.0, dtype=tf.float32)
+            one = tf.constant(1.0, dtype=tf.float16)
             
             # 현재 예측을 기반으로 평균 계산
             pred_x0 = (x - tf.sqrt(one - alpha_cumprod) * pred_noise) / tf.sqrt(alpha_cumprod)
@@ -258,11 +291,14 @@ class DiffusionModel:
             mean = c1 + c2
             
             # 분산 계산 및 노이즈 샘플링
-            var = beta * (one - alpha_cumprod_prev) / (one - alpha_cumprod)
-            noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float32)
+            var = tf.clip_by_value(
+                beta * (one - alpha_cumprod_prev) / (one - alpha_cumprod), 
+                0.0, 1.0  # 안전한 범위로 클리핑
+            )
+            noise = tf.random.normal(shape=tf.shape(x), dtype=tf.float16)  # float16 사용
             
-            # 최종 샘플 계산
-            x_prev = mean + tf.sqrt(var) * eta * noise
+            # 최종 샘플 계산 (오버플로우 방지)
+            x_prev = mean + tf.clip_by_value(tf.sqrt(var) * eta * noise, -1.0, 1.0)
             
             return x_prev
 
@@ -419,64 +455,52 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
     
     logger.info(f"데이터 형태: {data.shape}")
     
-    # 데이터 형태 확인 및 변환
-    if data.shape[1] == 2 and data.shape[2] > 1000:
-        # 필요한 변환: (samples, 2, width) -> (samples, width, 2)
-        data = np.transpose(data, (0, 2, 1))
-        logger.info(f"데이터 형태 변환 완료: {data.shape}")
-
     # 모델 설정
     diffusion = DiffusionModel(timesteps=timesteps, beta_schedule=beta_schedule)
-    if len(data.shape) == 3:
-        input_shape = (data.shape[1], data.shape[2], 1)
-        data = np.expand_dims(data, axis=-1)
-    else:
-        input_shape = data.shape[1:]
-    
-    logger.info(f"입력 형태: {input_shape}")
+    input_shape = (data.shape[1], data.shape[2], 1)  # 채널 차원 추가
     
     # 데이터를 올바른 형태로 변환 (채널 추가)
     data = np.expand_dims(data, axis=-1)
-    
-    # 모델 구축
-    model = build_unet_model(
-        input_shape=input_shape, 
-        time_embedding_dim=64, 
-        base_filters=32, 
-        depth=3, 
-        attention_res=[1, 2]
-    )
-    
-    # 옵티마이저 및 학습률 스케줄러 설정
-    lr_schedule = keras.optimizers.schedules.CosineDecay(
-        initial_learning_rate=1e-4,
-        decay_steps=epochs * (len(data) // batch_size),
-        alpha=0.1
-    )
-    optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
-    model.compile(optimizer=optimizer, loss='mse')
-    
-    # 모델 요약 출력
-    model.summary()
-    
     # 훈련 데이터를 메모리에 올림
-    samples = data
-    
+    samples = tf.cast(tf.convert_to_tensor(data), tf.float32)
     # 체크포인트 디렉토리 생성
     os.makedirs('checkpoints', exist_ok=True)
     
     # 학습 시작
-    for epoch in range(epochs):
-        logger.info(f"에포크 {epoch+1}/{epochs}")
-        total_loss = 0
-        num_batches = len(samples) // batch_size
+    strategy = None
+    gpus = tf.config.list_physical_devices('GPU')
+    
+    if len(gpus) > 1:
+        # 다중 GPU 사용
+        logger.info(f"{len(gpus)}개의 GPU를 사용한 분산 학습을 설정합니다.")
+        strategy = tf.distribute.MirroredStrategy()
+        batch_size = batch_size * len(gpus)  # 배치 크기 조정
+    else:
+        strategy = tf.distribute.OneDeviceStrategy(device="/device:GPU:0" if gpus else "/device:CPU:0")
+    
+    with strategy.scope():
+        # 모델 구축
+        model = build_unet_model(
+            input_shape=input_shape, 
+            time_embedding_dim=64, 
+            base_filters=32, 
+            depth=3, 
+            attention_res=[1, 2]
+        )
         
-        # 배치 학습
-        for batch_idx in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{epochs}"):
-            batch = samples[batch_idx*batch_size:(batch_idx+1)*batch_size]
-            batch = tf.convert_to_tensor(batch, dtype=tf.float32)
-
-            # 랜덤 타임스텝 선택
+        # 옵티마이저 및 학습률 스케줄러 설정
+        lr_schedule = keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=1e-4,
+            decay_steps=epochs * (len(data) // batch_size),
+            alpha=0.1
+        )
+        optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
+        model.compile(optimizer=optimizer, loss='mse')
+    
+        def train_step_fn(batch_indices):
+            batch_data = tf.gather(samples, batch_indices)
+            batch_data = tf.cast(batch_data, tf.float16)
+            
             t = tf.random.uniform(
                 shape=[batch_size], 
                 minval=0, 
@@ -484,36 +508,50 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                 dtype=tf.int32
             )
             
-            # 그래디언트 계산 및 적용
+            noise = tf.random.normal(shape=batch_data.shape, dtype=tf.float16)
+            x_noisy = diffusion.q_sample(batch_data, t, noise)
+            t_expanded = tf.expand_dims(t, -1)
+            
             with tf.GradientTape() as tape:
-                noise = tf.random.normal(shape=batch.shape)
-                x_noisy = diffusion.q_sample(batch, t, noise)
-
-                t_expanded = tf.expand_dims(t, -1)
                 predicted_noise = model([x_noisy, t_expanded], training=True)
-                
-                # 예측 형태 확인 및 조정
-                if noise.shape != predicted_noise.shape:
-                    predicted_noise = tf.slice(
-                        predicted_noise, 
-                        [0, 0, 0, 0], 
-                        [batch_size, noise.shape[1], noise.shape[2], noise.shape[3]]
-                    )
-                
-                # 손실 계산 (L2 손실)
                 loss = tf.reduce_mean(tf.square(noise - predicted_noise))
             
-            # 그래디언트 적용
             gradients = tape.gradient(loss, model.trainable_variables)
-            
-            # 그래디언트 클리핑 (NaN 방지)
-            gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in gradients]
-            
             optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            total_loss += loss.numpy()
+            return loss
         
-        # 에포크 종료 후 평균 손실 계산
-        avg_loss = total_loss / num_batches
+        if platform.system() == 'Darwin' and platform.processor() == 'arm':
+            # Apple Silicon에서는 tf.function 데코레이터에서 jit_compile 비활성화
+            @tf.function(jit_compile=False)
+            def train_step(batch_indices):
+                per_replica_losses = strategy.run(train_step_fn, args=(batch_indices,))
+                return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+        else:
+            # 다른 플랫폼에서는 jit_compile 활성화
+            @tf.function(jit_compile=True)
+            def train_step(batch_indices):
+                per_replica_losses = strategy.run(train_step_fn, args=(batch_indices,))
+                return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
+    
+    dataset = tf.data.Dataset.range(len(samples))
+    dataset = dataset.shuffle(buffer_size=min(len(samples), 10000))
+    dataset = dataset.batch(batch_size, drop_remainder=True)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)
+    
+    # 학습 시작
+    for epoch in range(epochs):
+        logger.info(f"에포크 {epoch+1}/{epochs}")
+        
+        # 사용자 정의 훈련 루프 실행
+        epoch_loss = 0
+        num_batches = 0
+        
+        for batch_indices in tqdm(dataset, desc=f"Epoch {epoch+1}/{epochs}"):
+            loss = train_step(batch_indices)
+            epoch_loss += loss
+            num_batches += 1
+        
+        avg_loss = epoch_loss / num_batches
         logger.info(f"에포크 {epoch+1} 평균 손실: {avg_loss:.6f}")
         
         # 모델 저장 (주기적으로)
@@ -538,30 +576,34 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         json.dump(diffusion_params, f)
     logger.info("디퓨전 파라미터 저장됨: diffusion_params.json")
 
-def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0):
-    x = tf.random.normal(shape, dtype=tf.float32)
-
-    for i in reversed(range(steps)):
-        print(f"샘플링 단계: {i}/{steps}", end="\r")
-        t = tf.ones((shape[0],), dtype=tf.int32) * i
-
+def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0, num_samples=4):
+    """여러 샘플을 병렬로 생성"""
+    # 배치 크기를 num_samples로 설정
+    batch_shape = (num_samples,) + shape[1:]
+    x = tf.random.normal(batch_shape, dtype=tf.float32)
+    
+    # 반복적인 노이즈 제거
+    for i in tqdm(reversed(range(steps)), desc="샘플링"):
+        t = tf.ones((batch_shape[0],), dtype=tf.int32) * i
+        
+        # 병렬 처리를 위한 배치 연산
         predicted_noise = model([x, t[:, None]], training=False)
-
+        
         alpha = tf.constant(diffusion.alphas[i], dtype=tf.float32)
         alpha_cumprod = tf.constant(diffusion.alphas_cumprod[i], dtype=tf.float32)
         alpha_cumprod_prev = tf.constant(diffusion.alphas_cumprod_prev[i], dtype=tf.float32)
-
+        
         one = tf.constant(1.0, dtype=tf.float32)
         sigma = eta * tf.sqrt((one - alpha_cumprod_prev) / (one - alpha_cumprod) * 
                              (one - alpha / alpha_cumprod_prev))
-
+        
         c1 = tf.math.rsqrt(alpha)
         c2 = (one - alpha) / tf.sqrt(one - alpha_cumprod)
         
         x = c1 * (x - c2 * predicted_noise)
         
         if i > 0:
-            noise = tf.random.normal(shape, dtype=tf.float32)
+            noise = tf.random.normal(batch_shape, dtype=tf.float32)
             x = x + sigma * noise
     
     return x
@@ -573,6 +615,7 @@ def load_model(model_path='autoencoder.keras'):
     return keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
 
 def inverse_transform(wavelet_data):
+    """병렬 웨이블릿 역변환"""
     if wavelet_data.ndim == 4:
         if wavelet_data.shape[3] == 1:
             wavelet_data = wavelet_data[0, :, :, 0]
@@ -580,21 +623,34 @@ def inverse_transform(wavelet_data):
             wavelet_data = wavelet_data[0]
     elif wavelet_data.ndim == 3 and wavelet_data.shape[0] == 1:
         wavelet_data = wavelet_data[0]
-    samples = []
-    try:
-        for i in range(wavelet_data.shape[0]):
-            try:
-                cA = wavelet_data[i, 0]
-                cD = wavelet_data[i, 1]
-                reconstructed = pywt.idwt(cA, cD, 'db1')
-                if reconstructed is not None:
-                    if not np.all(np.isnan(reconstructed)) and not np.all(reconstructed == 0):
-                        samples.extend(reconstructed) 
-            except Exception:
-                continue
-    except Exception:
-        samples = np.zeros(1000)
-    samples = np.array(samples)
+        
+    def process_segment(i):
+        try:
+            cA = wavelet_data[i, 0]
+            cD = wavelet_data[i, 1]
+            reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
+            if reconstructed is not None and not np.all(np.isnan(reconstructed)) and not np.all(reconstructed == 0):
+                return reconstructed
+        except Exception as e:
+            logger.error(f"역변환 중 오류 발생 (세그먼트 {i}): {str(e)}")
+        return None
+    
+    # 병렬 처리
+    with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 4)) as executor:
+        results = list(tqdm(
+            executor.map(process_segment, range(wavelet_data.shape[0])), 
+            total=wavelet_data.shape[0],
+            desc="웨이블릿 역변환"
+        ))
+    
+    # None이 아닌 결과들만 연결
+    valid_results = [r for r in results if r is not None]
+    if not valid_results:
+        logger.warning("유효한 오디오 세그먼트가 없습니다!")
+        return np.zeros(1000)
+    
+    # 결과 합치기
+    samples = np.concatenate(valid_results)
     return samples
 
 def save_audio(samples, output_path, sample_rate=44100):
@@ -682,19 +738,65 @@ def normalize_audio(samples, target_peak=0.9):
 
 if __name__ == '__main__':
     if platform.system() == 'Darwin' and platform.processor() == 'arm':
+        # Apple Silicon 최적화
         logger.info("Apple Silicon 감지, Metal 최적화 적용 중...")
-        # Metal 성능 향상을 위한 설정
         try:
-            # 메모리 제약 완화
-            tf.config.experimental.set_memory_growth(tf.config.list_physical_devices('GPU')[0], True)
-            # 최적화 옵션
-            tf.config.optimizer.set_jit(True)  # XLA 컴파일
-            # Apple Neural Engine 특화 옵션
-            os.environ['TF_METAL_DEVICE_FORCE_CPU'] = '0'  # 항상 Metal 사용
+            # 혼합 정밀도 활성화
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+            # Metal 성능 향상을 위한 설정
+            os.environ['TF_METAL_DEVICE_FORCE_CPU'] = '0'  # Metal 사용
             os.environ['TF_METAL_DEBUG_ERROR_INSERTION'] = '0'  # 디버그 비활성화
-            logger.info("Apple Neural Engine 최적화 적용 완료")
+            os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 메모리 동적 할당
+            
+            # 스레드 수 최적화
+            num_threads = min(32, os.cpu_count() * 2)  # 하이퍼스레딩 활용
+            tf.config.threading.set_inter_op_parallelism_threads(num_threads)
+            tf.config.threading.set_intra_op_parallelism_threads(num_threads)
+            
+            # 스레드 수 최적화
+            num_threads = min(32, os.cpu_count() * 2)  # 하이퍼스레딩 활용
+            tf.config.threading.set_inter_op_parallelism_threads(num_threads)
+            tf.config.threading.set_intra_op_parallelism_threads(num_threads)
+            
+            # Metal에서 문제가 될 수 있는 최적화 옵션 비활성화
+            tf.config.optimizer.set_experimental_options({
+                "layout_optimizer": False,  # 레이아웃 최적화 비활성화
+                "constant_folding": True,
+                "shape_optimization": True,
+                "remapping": False,  # 리매핑 비활성화
+                "arithmetic_optimization": True,
+                "dependency_optimization": True,
+                "loop_optimization": True,
+                "function_optimization": True,
+                "debug_stripper": True,
+                "auto_mixed_precision": True
+            })
+            
+            # 메모리 최적화
+            physical_devices = tf.config.list_physical_devices('GPU')
+            for device in physical_devices:
+                tf.config.experimental.set_memory_growth(device, True)
+                
+            logger.info(f"Apple Neural Engine 최적화 완료 (스레드: {num_threads})")
         except Exception as e:
-            logger.warning(f"Apple Neural Engine 최적화 적용 실패: {str(e)}")
+            logger.warning(f"Apple Neural Engine 최적화 실패: {str(e)}")
+    else:
+        # 비 Apple 장치에서는 XLA 사용 가능
+        tf.config.optimizer.set_jit(True)
+        
+        # 그래프 최적화 설정
+        tf.config.optimizer.set_experimental_options({
+            "layout_optimizer": True,
+            "constant_folding": True,
+            "shape_optimization": True,
+            "remapping": True,
+            "arithmetic_optimization": True,
+            "dependency_optimization": True,
+            "loop_optimization": True,
+            "function_optimization": True,
+            "debug_stripper": True,
+            "auto_mixed_precision": True
+        })
             
     check_available_devices()
     npu_available = configure_npu()
