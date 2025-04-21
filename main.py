@@ -143,22 +143,13 @@ def load_data_parallel(folder: str, max_files=MAX_FILES):
             logger.error(f"파일 처리 중 오류 발생: {wav_file}, {str(e)}")
             return []
     
-    # CPU 코어 수의 절반만 사용하여 리소스 경쟁 줄임
-    max_workers = max(1, os.cpu_count() // 2)
-    logger.info(f"병렬 처리에 {max_workers}개의 워커 사용")
-    
     # 병렬 처리
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         results = list(tqdm(executor.map(process_file, wav_files), total=len(wav_files)))
     
     # 결과 합치기
     for result in results:
-        if result:  # 빈 결과는 건너뛰기
-            data.extend(result)
-    
-    # 메모리 효율성을 위해 명시적 GC 호출
-    import gc
-    gc.collect()
+        data.extend(result)
     
     logger.info(f"총 {len(data)} 개의 세그먼트를 로드했습니다.")
     return np.array(data)
@@ -185,35 +176,20 @@ class DiffusionModel:
 
         # 나머지 파라미터 계산
         self.alphas = (1. - self.betas).astype(np.float32)
-        self.alphas = tf.cast(self.alphas, tf.bfloat16).numpy()
-        
         self.alphas_cumprod = np.cumprod(self.alphas).astype(np.float32)
-        self.alphas_cumprod = tf.cast(self.alphas_cumprod, tf.bfloat16).numpy()
-        
         self.alphas_cumprod_prev = np.append(np.float32(1.0), self.alphas_cumprod[:-1])
-        self.alphas_cumprod_prev = tf.cast(self.alphas_cumprod_prev, tf.bfloat16).numpy()
 
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod).astype(np.float32)
-        self.sqrt_alphas_cumprod = tf.cast(self.sqrt_alphas_cumprod, tf.bfloat16).numpy()
-        
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1. - self.alphas_cumprod).astype(np.float32)
-        self.sqrt_one_minus_alphas_cumprod = tf.cast(self.sqrt_one_minus_alphas_cumprod, tf.bfloat16).numpy()
-        
         self.sqrt_recip_alphas = np.sqrt(1. / self.alphas).astype(np.float32)
-        self.sqrt_recip_alphas = tf.cast(self.sqrt_recip_alphas, tf.bfloat16).numpy()
         
-        # 사후 분산과 평균 계산 (bf16으로 변환)
+        # 사후 분산과 평균 계산
         self.posterior_variance = (self.betas * (1. - self.alphas_cumprod_prev) / 
                                   (1. - self.alphas_cumprod)).astype(np.float32)
-        self.posterior_variance = tf.cast(self.posterior_variance, tf.bfloat16).numpy()
-        
         self.posterior_mean_coef1 = (self.betas * np.sqrt(self.alphas_cumprod_prev) / 
                                     (1. - self.alphas_cumprod)).astype(np.float32)
-        self.posterior_mean_coef1 = tf.cast(self.posterior_mean_coef1, tf.bfloat16).numpy()
-        
         self.posterior_mean_coef2 = ((1. - self.alphas_cumprod_prev) * np.sqrt(self.alphas) / 
                                     (1. - self.alphas_cumprod)).astype(np.float32)
-        self.posterior_mean_coef2 = tf.cast(self.posterior_mean_coef2, tf.bfloat16).numpy()
     
     def q_sample(self, x_0, t, noise=None):
         """forward 과정 (노이즈 추가)"""
@@ -234,18 +210,19 @@ class DiffusionModel:
     def p_losses(self, denoise_model, x_0, t, noise=None, loss_type="l2"):
         """모델 학습을 위한 손실 함수"""
         if noise is None:
-            noise = tf.random.normal(shape=tf.shape(x_0), dtype=tf.bfloat16)
-
-        sqrt_alphas_cumprod_t = tf.cast(tf.gather(self.sqrt_alphas_cumprod, t), tf.bfloat16)
-        sqrt_one_minus_alphas_cumprod_t = tf.cast(
-            tf.gather(self.sqrt_one_minus_alphas_cumprod, t), tf.bfloat16)
+            noise = tf.random.normal(shape=tf.shape(x_0))
         
-        # 차원 확장
-        while len(sqrt_alphas_cumprod_t.shape) < len(x_0.shape):
-            sqrt_alphas_cumprod_t = tf.expand_dims(sqrt_alphas_cumprod_t, -1)
-            sqrt_one_minus_alphas_cumprod_t = tf.expand_dims(sqrt_one_minus_alphas_cumprod_t, -1)
+        x_noisy = self.q_sample(x_0, t, noise)
+        predicted_noise = denoise_model([x_noisy, t], training=True)
         
-        return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
+        if loss_type == "l1":
+            loss = tf.reduce_mean(tf.abs(noise - predicted_noise))
+        elif loss_type == "huber":
+            loss = tf.keras.losses.Huber(delta=1.0)(noise, predicted_noise)
+        else:  # l2
+            loss = tf.reduce_mean(tf.square(noise - predicted_noise))
+            
+        return loss
     
     def p_sample(self, model, x, t, t_index, eta=0.0):
         """단일 샘플링 스텝 (노이즈 제거)"""
@@ -258,21 +235,18 @@ class DiffusionModel:
         else:
             device = "/device:CPU:0"
         
-        with tf.device(device):
-            # 타입 변환
-            x = tf.cast(x, tf.bfloat16)
-            
+        with tf.device(device):  # GPU 사용 명시
             # 예측된 노이즈 계산
             pred_noise = model([x, t], training=False)
             
-            # 알파 값들 준비 (bf16으로 변환)
-            alpha = tf.constant(self.alphas[t_index], dtype=tf.bfloat16)
-            alpha_cumprod = tf.constant(self.alphas_cumprod[t_index], dtype=tf.bfloat16)
-            alpha_cumprod_prev = tf.constant(self.alphas_cumprod_prev[t_index], dtype=tf.bfloat16)
-            beta = tf.constant(self.betas[t_index], dtype=tf.bfloat16)
+            # 알파 값들 준비
+            alpha = tf.constant(self.alphas[t_index], dtype=tf.float32)
+            alpha_cumprod = tf.constant(self.alphas_cumprod[t_index], dtype=tf.float32)
+            alpha_cumprod_prev = tf.constant(self.alphas_cumprod_prev[t_index], dtype=tf.float32)
+            beta = tf.constant(self.betas[t_index], dtype=tf.float32)
             
             # 상수 준비
-            one = tf.constant(1.0, dtype=tf.bfloat16)
+            one = tf.constant(1.0, dtype=tf.float32)
             
             # 현재 예측을 기반으로 평균 계산
             pred_x0 = (x - tf.sqrt(one - alpha_cumprod) * pred_noise) / tf.sqrt(alpha_cumprod)
@@ -488,9 +462,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         # 배치 학습
         for batch_idx in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{epochs}"):
             batch = samples[batch_idx*batch_size:(batch_idx+1)*batch_size]
-            # float32에서 bfloat16으로 변환
             batch = tf.convert_to_tensor(batch, dtype=tf.float32)
-            batch = tf.cast(batch, tf.bfloat16)
 
             # 랜덤 타임스텝 선택
             t = tf.random.uniform(
@@ -502,8 +474,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             
             # 그래디언트 계산 및 적용
             with tf.GradientTape() as tape:
-                noise = tf.random.normal(shape=batch.shape, dtype=tf.float32)
-                noise = tf.cast(noise, tf.bfloat16)
+                noise = tf.random.normal(shape=batch.shape)
                 x_noisy = diffusion.q_sample(batch, t, noise)
 
                 t_expanded = tf.expand_dims(t, -1)
@@ -736,8 +707,8 @@ if __name__ == '__main__':
     elif sys.argv[1] == 'train':
         source_path = sys.argv[2] if len(sys.argv) > 2 else 'data/wav'
         steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
-        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 10
-        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 32
+        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 64
         beta_schedule = sys.argv[6] if len(sys.argv) > 6 else 'cosine'
         
         logger.info(f"학습 시작: {source_path}, timesteps={steps}, epochs={epochs}, batch_size={batch_size}, beta_schedule={beta_schedule}")
