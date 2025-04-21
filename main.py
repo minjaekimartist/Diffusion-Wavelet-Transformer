@@ -143,13 +143,22 @@ def load_data_parallel(folder: str, max_files=MAX_FILES):
             logger.error(f"파일 처리 중 오류 발생: {wav_file}, {str(e)}")
             return []
     
+    # CPU 코어 수의 절반만 사용하여 리소스 경쟁 줄임
+    max_workers = max(1, os.cpu_count() // 2)
+    logger.info(f"병렬 처리에 {max_workers}개의 워커 사용")
+    
     # 병렬 처리
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         results = list(tqdm(executor.map(process_file, wav_files), total=len(wav_files)))
     
     # 결과 합치기
     for result in results:
-        data.extend(result)
+        if result:  # 빈 결과는 건너뛰기
+            data.extend(result)
+    
+    # 메모리 효율성을 위해 명시적 GC 호출
+    import gc
+    gc.collect()
     
     logger.info(f"총 {len(data)} 개의 세그먼트를 로드했습니다.")
     return np.array(data)
@@ -728,7 +737,7 @@ if __name__ == '__main__':
         source_path = sys.argv[2] if len(sys.argv) > 2 else 'data/wav'
         steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
         epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 10
-        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 64
+        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 32
         beta_schedule = sys.argv[6] if len(sys.argv) > 6 else 'cosine'
         
         logger.info(f"학습 시작: {source_path}, timesteps={steps}, epochs={epochs}, batch_size={batch_size}, beta_schedule={beta_schedule}")
