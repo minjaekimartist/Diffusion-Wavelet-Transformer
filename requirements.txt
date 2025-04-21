@@ -1,0 +1,10 @@
+datasets
+librosa
+keras
+PyWavelets
+mido
+numpy
+sentence_transformers
+tensorflow
+tf-keras
+tensorflow_probability
