@@ -13,6 +13,8 @@ import sys
 import tensorflow as tf
 from tqdm import tqdm
 import wave
+from sentence_transformers import SentenceTransformer
+from text_embedding import text_to_embedding, setup_embedding_model, adjust_embedding_dimension, embed_dim
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +30,7 @@ sample_size = 2048
 WAVELET_TYPE = 'db4'  # 웨이블릿 타입 (db1, db4, sym4 등)
 MAX_FILES = 100       # 처리할 최대 파일 수
 DEFAULT_SAMPLE_RATE = 48000
+TEXT_EMBED_DIM = 512  # 텍스트 임베딩 차원
 
 def check_available_devices():
     """사용 가능한 장치 목록 확인"""
@@ -93,7 +96,7 @@ class Data:
             
         self.sample_rate = wave_file.getframerate()
         data = wave_file.readframes(wave_file.getnframes())
-        self.samples = []
+        sample_values = []
         sample_width = wave_file.getsampwidth()
         channels = wave_file.getnchannels()
         
@@ -107,9 +110,10 @@ class Data:
             sample = data[i * bytes_per_sample: (i + 1) * bytes_per_sample]
             int_value = int.from_bytes(sample, byteorder='little', signed=True)
             float_value = float(int_value) / max_value
-            self.samples.append(float_value)
+            sample_values.append(float_value)
             
         wave_file.close()
+        self.samples = np.array(sample_values, dtype=np.float32)
         logger.info(f'Loaded wave file: {path} (길이: {len(self.samples)})')
 
     def transform(self) -> list[np.ndarray]:    
@@ -118,18 +122,28 @@ class Data:
         segments = len(self.samples) // sample_size
         segments_list = []
         
-        # 세그먼트 미리 준비
+        # 세그먼트 미리 준비 (NumPy 배열로 변환)
         for i in range(segments):
             segment = self.samples[i * sample_size: (i + 1) * sample_size]
             if len(segment) == sample_size:  # 세그먼트가 짧으면 건너뛰기
-                segments_list.append(segment)
+                # 명시적으로 NumPy 배열로 변환
+                segments_list.append(np.array(segment, dtype=np.float32))
         
         def process_segment(segment):
             try:
+                # segment가 NumPy 배열인지 확인
+                if not isinstance(segment, np.ndarray):
+                    segment = np.array(segment, dtype=np.float32)
+                    
+                # shape 속성 확인
+                if not hasattr(segment, 'shape'):
+                    return None
+                    
                 # 노이즈 추가로 증강 (약 10%)
                 if np.random.random() < 0.1:
                     noise_level = np.random.uniform(0.001, 0.01)
-                    segment = segment + np.random.normal(0, noise_level, segment.shape)
+                    noise = np.random.normal(0, noise_level, segment.shape)
+                    segment = segment + noise
                 
                 # 진폭 변화 (약 20%)
                 if np.random.random() < 0.2:
@@ -145,6 +159,7 @@ class Data:
                 
                 if np.any(np.isnan(cA)) or np.any(np.isnan(cD)):
                     return None
+                    
                 return np.array([cA, cD])
             except Exception as e:
                 logger.error(f"세그먼트 처리 중 오류 발생: {str(e)}")
@@ -207,7 +222,7 @@ class DiffusionModel:
             alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * np.pi / 2) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            return np.clip(betas, 0, 0.999)
+            self.betas = np.clip(betas, 0, 0.999)
         else:
             self.betas = np.linspace(beta_start, beta_end, timesteps, dtype=np.float32)
 
@@ -430,6 +445,31 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
     model = keras.models.Model([inputs, time_input], outputs)
     return model
 
+@keras.saving.register_keras_serializable()
+class MatMulLayer(keras.layers.Layer):
+    def call(self, inputs):
+        return tf.matmul(inputs[0], inputs[1])
+    
+    def compute_output_shape(self, input_shapes):
+        return (input_shapes[0][0], input_shapes[0][1], input_shapes[1][2])
+
+@keras.saving.register_keras_serializable()
+class ScaleLayer(keras.layers.Layer):
+    def __init__(self, scale_factor, **kwargs):
+        super().__init__(**kwargs)
+        self.scale_factor = scale_factor
+    
+    def call(self, inputs):
+        return inputs / self.scale_factor
+    
+    def compute_output_shape(self, input_shape):
+        return input_shape
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({"scale_factor": self.scale_factor})
+        return config
+
 def attention_block(x, filters):
     """셀프 어텐션 블록"""
     h = x
@@ -447,12 +487,13 @@ def attention_block(x, filters):
     
     # 어텐션 맵 계산
     q = keras.layers.Permute((2, 1))(q)  # 전치
-    attn = keras.layers.Lambda(lambda x: tf.matmul(x[0], x[1]))([k, q])
-    attn = keras.layers.Lambda(lambda x: x / np.sqrt(filters // 8))(attn)
-    attn = keras.layers.Softmax(axis=-1)(attn)
     
-    # 값과 결합
-    output = keras.layers.Lambda(lambda x: tf.matmul(x[0], x[1]))([attn, v])
+    # Lambda 대신 커스텀 레이어 사용
+    attn = MatMulLayer()([k, q])
+    attn = ScaleLayer(np.sqrt(filters // 8))(attn)
+    attn = keras.layers.Softmax(axis=-1)(attn)
+    output = MatMulLayer()([attn, v])
+    
     output = keras.layers.Reshape((height, width, filters))(output)
     
     # 원본과 결합
@@ -537,8 +578,9 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             batch_data = tf.gather(samples, batch_indices)
             batch_data = tf.cast(batch_data, tf.float16)
             
-            accumulated_gradients = None
+            accumulated_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
             num_accumulations = 4  # 4번 누적 (가상 배치 크기 = 4 * batch_size)
+            total_loss = 0.0
             
             # 그래디언트 누적
             for i in range(num_accumulations):
@@ -554,27 +596,25 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                     dtype=tf.int32
                 )
                 
-                noise = tf.random.normal(shape=sub_batch.shape, dtype=tf.float16)
+                # 수정된 부분: 노이즈 형태 모델 출력과 일치시키기
+                noise = tf.random.normal(shape=tf.shape(sub_batch), dtype=tf.float16)
                 x_noisy = diffusion.q_sample(sub_batch, t, noise)
                 t_expanded = tf.expand_dims(t, -1)
                 
                 with tf.GradientTape() as tape:
                     predicted_noise = model([x_noisy, t_expanded], training=True)
+                    
+                    # 형태 일치 확인 및 필요시 조정
+                    if noise.shape != predicted_noise.shape:
+                        noise = tf.reshape(noise, predicted_noise.shape)
+                        
                     loss = tf.reduce_mean(tf.square(noise - predicted_noise)) / num_accumulations
-                
-                gradients = tape.gradient(loss, model.trainable_variables)
-                
-                # 그래디언트 누적
-                if accumulated_gradients is None:
-                    accumulated_gradients = gradients
-                else:
-                    accumulated_gradients = [accu_grad + grad for accu_grad, grad in zip(accumulated_gradients, gradients)]
+                    total_loss += loss * num_accumulations
             
             # 클리핑 및 적용
             accumulated_gradients, _ = tf.clip_by_global_norm(accumulated_gradients, clip_norm=1.0)
             optimizer.apply_gradients(zip(accumulated_gradients, model.trainable_variables))
-            return loss * num_accumulations  # 원래 손실 크기로 반환
-        
+            return total_loss  # 원래 손실 크기로 반환
         if platform.system() == 'Darwin' and platform.processor() == 'arm':
             # Apple Silicon에서는 tf.function 데코레이터에서 jit_compile 비활성화
             @tf.function(jit_compile=False, reduce_retracing=True)
@@ -597,83 +637,27 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         # GPU 메모리 효율성을 위한 데이터 프리페치
         batch_size = min(batch_size, 64)  # 메모리 오버플로우 방지
         logger.info(f"CUDA 최적화: 배치 크기 {batch_size}로 조정")
-    
-    warmup_epochs = 5
-    initial_lr = 1e-5
+
     # 학습 시작
     for epoch in range(epochs):
         logger.info(f"에포크 {epoch+1}/{epochs}")
-        # 학습률 조정 (워밍업)
-        if epoch < warmup_epochs:
-        # 첫 5에포크 동안 학습률을 서서히 증가
-            lr = initial_lr * (epoch + 1) / warmup_epochs
-            keras.backend.set_value(optimizer.learning_rate, lr)
 
-        # 사용자 정의 훈련 루프 실행
+        # 데이터셋을 사용한 학습 루프
         epoch_loss = 0
-        num_batches = len(samples) // batch_size
+        step = 0
         
-        # 배치 학습
-        for batch_idx in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{epochs}"):
-            batch = samples[batch_idx*batch_size:(batch_idx+1)*batch_size]
-            batch = tf.convert_to_tensor(batch, dtype=tf.float32)
-
-            # 랜덤 타임스텝 선택
-            t = tf.random.uniform(
-                shape=[batch_size], 
-                minval=0, 
-                maxval=timesteps, 
-                dtype=tf.int32
-            )
-            
-            # 그래디언트 계산 및 적용
-            with tf.GradientTape() as tape:
-                noise = tf.random.normal(shape=batch.shape)
-                x_noisy = diffusion.q_sample(batch, t, noise)
-
-                t_expanded = tf.expand_dims(t, -1)
-                predicted_noise = model([x_noisy, t_expanded], training=True)
-                
-                # 예측 형태 확인 및 조정
-                if noise.shape != predicted_noise.shape:
-                    predicted_noise = tf.slice(
-                        predicted_noise, 
-                        [0, 0, 0, 0], 
-                        [batch_size, noise.shape[1], noise.shape[2], noise.shape[3]]
-                    )
-                
-                # 손실 계산 (L2 손실)
-                loss = tf.reduce_mean(tf.square(noise - predicted_noise))
-                
-                # 혼합 정밀도 스케일링 (필요한 경우)
-                if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
-                    if isinstance(optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
-                        scaled_loss = optimizer.get_scaled_loss(loss)
-                    else:
-                        scaled_loss = loss
-                else:
-                    scaled_loss = loss
-            
-            # 그래디언트 적용
-            gradients = tape.gradient(scaled_loss, model.trainable_variables)
-            
-            # 혼합 정밀도 그래디언트 스케일링 (필요한 경우)
-            if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
-                if isinstance(optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
-                    gradients = optimizer.get_unscaled_gradients(gradients)
-            
-            # 그래디언트 클리핑 (NaN 방지)
-            gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in gradients]
-            
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            total_loss += loss.numpy()
+        # 미리 생성한 데이터셋 사용
+        for batch_indices in tqdm(dataset, desc=f"Epoch {epoch+1}/{epochs}"):
+            loss = train_step(batch_indices)
+            epoch_loss += loss
+            step += 1
             
             # 메모리 정리 (선택적)
-            if batch_idx % 10 == 0 and tf.config.list_physical_devices('GPU'):
+            if step % 10 == 0 and tf.config.list_physical_devices('GPU'):
                 tf.keras.backend.clear_session()
         
         # 에포크 종료 후 평균 손실 계산
-        avg_loss = epoch_loss / num_batches
+        avg_loss = epoch_loss / step
         logger.info(f"에포크 {epoch+1} 평균 손실: {avg_loss:.6f}")
         
         # 모델 저장 (주기적으로)
@@ -700,16 +684,44 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
 
 def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0, num_samples=4):
     """여러 샘플을 병렬로 생성"""
-    # 배치 크기를 num_samples로 설정
-    batch_shape = (num_samples,) + shape[1:]
-    x = tf.random.normal(batch_shape, dtype=tf.float32)
+    # 모델 입력 형태 확인
+    exp_input_shape = model.input[0].shape if isinstance(model.input, list) else model.input.shape
     
+    # 배치 크기만 조정하고 나머지 형태는 모델 기대값과 일치시킴
+    # 1차원 (배치 크기)만 조정
+    batch_shape = (num_samples,)
+    # 나머지 차원은 모델 입력 형태에서 가져옴 (None 부분을 제외하고)
+    for dim in exp_input_shape[1:]:
+        # None이 아닌 차원만 사용
+        if dim is not None:
+            batch_shape = batch_shape + (dim,)
+
+    logger.info(f"샘플링 배치 형태: {batch_shape}")
+    
+    if len(batch_shape) <= 1:
+        logger.warning("모델 입력 형태를 확인할 수 없습니다. 기본값 사용")
+        batch_shape = (num_samples, 1024, 2, 1)
+
+    x = tf.random.normal(batch_shape, dtype=tf.float32)
+
+    # 생성된 데이터 안정성 보장
+    x_np = x.numpy()
+    # NaN 또는 무한대 값 처리
+    x_np = np.nan_to_num(x_np, nan=0.0, posinf=1.0, neginf=-1.0)
+    # 극단값 제한
+    x_np = np.clip(x_np, -5.0, 5.0)
+    x = tf.convert_to_tensor(x_np, dtype=tf.float32)
+
     # 반복적인 노이즈 제거
     for i in tqdm(reversed(range(steps)), desc="샘플링"):
         t = tf.ones((batch_shape[0],), dtype=tf.int32) * i
         
-        # 병렬 처리를 위한 배치 연산
-        predicted_noise = model([x, t[:, None]], training=False)
+        # 형태 로깅 추가 (처음에만)
+        if i == steps-1:
+            logger.info(f"샘플링 입력 형태: {x.shape}, 시간 형태: {t[:, None].shape}")
+        
+        # 예측된 노이즈 계산
+        predicted_noise = tf.cast(model([x, t[:, None]], training=False), tf.float32)
         
         alpha = tf.constant(diffusion.alphas[i], dtype=tf.float32)
         alpha_cumprod = tf.constant(diffusion.alphas_cumprod[i], dtype=tf.float32)
@@ -721,14 +733,25 @@ def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0, num_sample
         
         c1 = tf.math.rsqrt(alpha)
         c2 = (one - alpha) / tf.sqrt(one - alpha_cumprod)
-        
         x = c1 * (x - c2 * predicted_noise)
         
         if i > 0:
             noise = tf.random.normal(batch_shape, dtype=tf.float32)
             x = x + sigma * noise
     
-    return x
+    x_np = x.numpy()
+    x_np = np.nan_to_num(x_np, nan=0.0, posinf=1.0, neginf=-1.0)
+    x_np = np.clip(x_np, -10.0, 10.0)
+    
+    # 데이터 유효성 확인 (필요시 로깅)
+    x_result = x.numpy()
+    has_issue = np.any(np.isnan(x_result)) or np.any(np.isinf(x_result))
+    if has_issue:
+        logger.warning("생성된 데이터에 문제가 있어 수정합니다.")
+        x_result = np.nan_to_num(x_result, nan=0.0, posinf=1.0, neginf=-1.0)
+        x_result = np.clip(x_result, -1.0, 1.0)
+    
+    return tf.convert_to_tensor(x_result, dtype=tf.float32)
 
 def load_model(model_path='autoencoder.keras'):
     custom_objects = {
@@ -737,57 +760,147 @@ def load_model(model_path='autoencoder.keras'):
     return keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
 
 def inverse_transform(wavelet_data):
-    """병렬 웨이블릿 역변환"""
+    """병렬 웨이블릿 역변환 (스테레오 지원)"""
+    original_shape = wavelet_data.shape
+    logger.info(f"입력 웨이블릿 데이터 형태: {original_shape}")
+    
+    # 여러 형태의 입력 처리
     if wavelet_data.ndim == 4:
         if wavelet_data.shape[3] == 1:
-            wavelet_data = wavelet_data[0, :, :, 0]
-        else:
-            wavelet_data = wavelet_data[0]
-    elif wavelet_data.ndim == 3 and wavelet_data.shape[0] == 1:
-        wavelet_data = wavelet_data[0]
-        
+            wavelet_data = wavelet_data[:, :, :, 0]  # 채널 차원 제거
+    
+    # 데이터가 NumPy 배열인지 확인
+    if not isinstance(wavelet_data, np.ndarray):
+        wavelet_data = np.array(wavelet_data)
+    
+    if wavelet_data.ndim == 4 and wavelet_data.shape[3] == 1:
+        wavelet_data = wavelet_data.squeeze(axis=3)
+    
+    logger.info(f"처리 전 웨이블릿 데이터 형태: {wavelet_data.shape}")
+    
     def process_segment(i):
         try:
-            cA = wavelet_data[i, 0]
-            cD = wavelet_data[i, 1]
-            reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
-            if reconstructed is not None and not np.all(np.isnan(reconstructed)) and not np.all(reconstructed == 0):
+            # 인덱스 검사
+            if i >= wavelet_data.shape[0]:
+                return None
+                
+            # 데이터 추출 및 형태 확인
+            if wavelet_data.ndim == 3:
+                # 큰 데이터를 작은 청크로 분할 처리
+                cA_full = np.array(wavelet_data[i, 0], dtype=np.float32)
+                cD_full = np.array(wavelet_data[i, 1], dtype=np.float32)
+
+                print(f"cA_full 형태: {cA_full.shape}, cD_full 형태: {cD_full.shape}")
+                
+                # 길이 맞추기
+                min_len = min(len(cA_full), len(cD_full))
+                cA = cA_full[:min_len]
+                cD = cD_full[:min_len]
+            else:
+                # 지원되지 않는 형태
+                logger.warning(f"지원되지 않는 데이터 형태: {wavelet_data.shape}")
+                return None
+            
+            # 빈 배열 확인
+            if cA.size == 0 or cD.size == 0:
+                logger.warning(f"세그먼트 {i}에서 빈 계수 발견")
+                return None
+            
+            # NaN 및 무한대 값 대체
+            cA = np.nan_to_num(cA, nan=0.0, posinf=0.1, neginf=-0.1)
+            cD = np.nan_to_num(cD, nan=0.0, posinf=0.1, neginf=-0.1)
+            
+            # 극단값 클리핑
+            cA = np.clip(cA, -3.0, 3.0)
+            cD = np.clip(cD, -3.0, 3.0)
+            
+            # 역변환 시도
+            try:
+                reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
+                
+                # None 체크 추가
+                if reconstructed is None or reconstructed.size == 0:
+                    logger.warning(f"세그먼트 {i}에서 역변환 실패")
+                    return None
+                
+                # 결과 검증 및 클리핑
+                reconstructed = np.nan_to_num(reconstructed, nan=0.0)
+                reconstructed = np.clip(reconstructed, -1.0, 1.0)
                 return reconstructed
+                
+            except Exception as e:
+                logger.error(f"세그먼트 {i}에서 역변환 오류: {str(e)}")
+                return None
+                    
         except Exception as e:
-            logger.error(f"역변환 중 오류 발생 (세그먼트 {i}): {str(e)}")
-        return None
+            logger.error(f"세그먼트 처리 중 오류: {str(e)}")
+            return None
     
     # 병렬 처리
-    with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() or 4)) as executor:
-        results = list(tqdm(
-            executor.map(process_segment, range(wavelet_data.shape[0])), 
-            total=wavelet_data.shape[0],
-            desc="웨이블릿 역변환"
-        ))
+    with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 4)) as executor:
+        futures = {executor.submit(process_segment, i): i for i in range(wavelet_data.shape[0])}
+        
+        # 진행 표시줄 준비
+        results = [None] * wavelet_data.shape[0]
+        for future in tqdm(concurrent.futures.as_completed(futures), 
+                         total=wavelet_data.shape[0], 
+                         desc="웨이블릿 역변환"):
+            idx = futures[future]
+            try:
+                result = future.result()
+                if result is not None:
+                    results[idx] = result
+            except Exception as e:
+                logger.error(f"세그먼트 {idx} 처리 중 예외: {str(e)}")
     
     # None이 아닌 결과들만 연결
     valid_results = [r for r in results if r is not None]
     if not valid_results:
         logger.warning("유효한 오디오 세그먼트가 없습니다!")
-        return np.zeros(1000)
+        return None
     
-    # 결과 합치기
-    samples = np.concatenate(valid_results)
+    # 스테레오 변환
+    stereo_results = []
+    for res in valid_results:
+        if len(res.shape) == 1:  # 모노인 경우 스테레오로 변환
+            stereo = np.zeros((len(res), 2), dtype=np.float32)
+            stereo[:, 0] = res  # 왼쪽 채널
+            stereo[:, 1] = res  # 오른쪽 채널
+            stereo_results.append(stereo)
+        else:
+            stereo_results.append(res)
+    
+    # 결과 합치기 (스테레오 형식으로)
+    samples = np.concatenate(stereo_results, axis=0)
+    logger.info(f"생성된 오디오 형태: {samples.shape}")
     return samples
 
 def save_audio(samples, output_path, sample_rate=44100):
+    """오디오 데이터를 WAV 파일로 저장 (스테레오 지원)"""
     samples = normalize_audio(samples)
     samples = np.clip(samples, -1.0, 1.0)
     
+    # 스테레오 또는 모노 확인
+    is_stereo = len(samples.shape) > 1 and samples.shape[1] == 2
+    
     with wave.open(output_path, 'w') as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)
+        wav_file.setnchannels(2 if is_stereo else 1)  # 스테레오는 2채널
+        wav_file.setsampwidth(2)  # 16-bit 오디오
         wav_file.setframerate(sample_rate)
-
-        for sample in samples:
-            value = int(sample * 32767.0)
-            data = struct.pack('<h', value)
-            wav_file.writeframes(data)
+        
+        if is_stereo:
+            # 스테레오 처리
+            for i in range(len(samples)):
+                left = int(samples[i, 0] * 32767.0)
+                right = int(samples[i, 1] * 32767.0)
+                data = struct.pack('<hh', left, right)
+                wav_file.writeframes(data)
+        else:
+            # 모노 처리 (하위 호환성 유지)
+            for sample in samples:
+                value = int(sample * 32767.0)
+                data = struct.pack('<h', value)
+                wav_file.writeframes(data)
 
 def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     """오디오 생성 함수"""
@@ -800,6 +913,7 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     
     # 모델 로드
     try:
+        keras.config.enable_unsafe_deserialization()
         model = keras.models.load_model('diffusion_model.keras')
         logger.info("모델 로드 성공")
     except Exception as e:
@@ -828,8 +942,13 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     diffusion.sqrt_one_minus_alphas_cumprod = np.sqrt(1. - diffusion.alphas_cumprod).astype(np.float32)
 
     # 생성할 데이터 형태
-    shape = (1, 2048, 2, 1)  # 베치 크기, 높이, 너비, 채널
-
+    shape = (1, 1027, 2, 1)  # 베치 크기, 높이, 너비, 채널
+    
+    # 출력 형태 미리 확인
+    input_details = {'input_shapes': [model.input_shape if isinstance(model.input, list) else [model.input_shape]]}
+    logger.info(f"모델 입력 형태: {input_details['input_shapes']}")
+    logger.info(f"사용될 생성 형태: {shape}")
+    
     # 샘플링
     logger.info(f"샘플링 시작 (스텝: {steps}, eta: {eta})")
     generated = sample_from_diffusion(model, diffusion, shape, steps=steps, eta=eta)
@@ -852,10 +971,25 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     }
 
 def normalize_audio(samples, target_peak=0.9):
-    max_amp = np.max(np.abs(samples))
-    if max_amp > 0:
-        gain = target_peak / max_amp
-        samples = samples * gain
+    """오디오 샘플 정규화 (스테레오 지원)"""
+    # 스테레오인 경우
+    if len(samples.shape) > 1 and samples.shape[1] == 2:
+        # 각 채널별로 최대 진폭 계산
+        max_amp_left = np.max(np.abs(samples[:, 0]))
+        max_amp_right = np.max(np.abs(samples[:, 1]))
+        max_amp = max(max_amp_left, max_amp_right)
+        
+        if max_amp > 0:
+            gain = target_peak / max_amp
+            # 두 채널에 동일한 게인 적용 (스테레오 밸런스 유지)
+            samples = samples * gain
+    else:
+        # 모노인 경우 (기존 로직)
+        max_amp = np.max(np.abs(samples))
+        if max_amp > 0:
+            gain = target_peak / max_amp
+            samples = samples * gain
+            
     return samples
 
 def configure_cuda():
@@ -989,10 +1123,10 @@ if __name__ == '__main__':
         print("  python main.py generate [output_path] [steps] [eta] [seed]")
         sys.exit(1)
     elif sys.argv[1] == 'train':
-        source_path = sys.argv[2] if len(sys.argv) > 2 else 'data/wav'
-        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 200
-        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 200
-        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 256
+        source_path = sys.argv[2] if len(sys.argv) > 2 else 'samples'
+        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 128
         beta_schedule = sys.argv[6] if len(sys.argv) > 6 else 'cosine'
         
         logger.info(f"학습 시작: {source_path}, timesteps={steps}, epochs={epochs}, batch_size={batch_size}, beta_schedule={beta_schedule}")
@@ -1000,7 +1134,7 @@ if __name__ == '__main__':
     elif sys.argv[1] == 'generate':
         output_path = sys.argv[2] if len(sys.argv) > 2 else 'generated.wav'
         steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
-        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 0.3
+        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 0
         seed = int(sys.argv[5]) if len(sys.argv) > 5 else None
         
         logger.info(f"생성 시작: {output_path}, steps={steps}, eta={eta}, seed={seed}")
