@@ -596,7 +596,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                     dtype=tf.int32
                 )
                 
-                # 수정된 부분: 노이즈 형태 모델 출력과 일치시키기
+                # 수정: noise 타입을 tf.float16으로 일치시킴
                 noise = tf.random.normal(shape=tf.shape(sub_batch), dtype=tf.float16)
                 x_noisy = diffusion.q_sample(sub_batch, t, noise)
                 t_expanded = tf.expand_dims(t, -1)
@@ -608,11 +608,16 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                     if noise.shape != predicted_noise.shape:
                         noise = tf.reshape(noise, predicted_noise.shape)
                         
+                    # 두 텐서의 타입 확인 및 일치
+                    if noise.dtype != predicted_noise.dtype:
+                        noise = tf.cast(noise, predicted_noise.dtype)
+                        
                     loss = tf.reduce_mean(tf.square(noise - predicted_noise)) / num_accumulations
                     total_loss += loss * num_accumulations
-            
-            # 클리핑 및 적용
-            accumulated_gradients, _ = tf.clip_by_global_norm(accumulated_gradients, clip_norm=1.0)
+                
+                # 그래디언트 계산 및 누적
+                gradients = tape.gradient(loss, model.trainable_variables)
+                accumulated_gradients = [accum_grad + grad for accum_grad, grad in zip(accumulated_gradients, gradients)]
             optimizer.apply_gradients(zip(accumulated_gradients, model.trainable_variables))
             return total_loss  # 원래 손실 크기로 반환
         if platform.system() == 'Darwin' and platform.processor() == 'arm':
@@ -1126,14 +1131,14 @@ if __name__ == '__main__':
         source_path = sys.argv[2] if len(sys.argv) > 2 else 'samples'
         steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
         epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 128
+        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 32
         beta_schedule = sys.argv[6] if len(sys.argv) > 6 else 'cosine'
         
         logger.info(f"학습 시작: {source_path}, timesteps={steps}, epochs={epochs}, batch_size={batch_size}, beta_schedule={beta_schedule}")
         train(source_path, timesteps=steps, epochs=epochs, batch_size=batch_size, beta_schedule=beta_schedule)
     elif sys.argv[1] == 'generate':
         output_path = sys.argv[2] if len(sys.argv) > 2 else 'generated.wav'
-        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 10
         eta = float(sys.argv[4]) if len(sys.argv) > 4 else 0
         seed = int(sys.argv[5]) if len(sys.argv) > 5 else None
         
