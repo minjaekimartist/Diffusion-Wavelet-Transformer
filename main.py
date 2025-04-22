@@ -126,9 +126,23 @@ class Data:
         
         def process_segment(segment):
             try:
-                # 웨이블릿 변환
+                # 노이즈 추가로 증강 (약 10%)
+                if np.random.random() < 0.1:
+                    noise_level = np.random.uniform(0.001, 0.01)
+                    segment = segment + np.random.normal(0, noise_level, segment.shape)
+                
+                # 진폭 변화 (약 20%)
+                if np.random.random() < 0.2:
+                    gain = np.random.uniform(0.8, 1.2)
+                    segment = segment * gain
+                    
+                # 웨이블릿 변환 - 기존 코드와 동일
                 cA, cD = pywt.dwt(segment, WAVELET_TYPE)
-                # 유효한 결과인지 확인
+                
+                # 정규화 추가
+                cA = (cA - np.mean(cA)) / (np.std(cA) + 1e-8)
+                cD = (cD - np.mean(cD)) / (np.std(cD) + 1e-8)
+                
                 if np.any(np.isnan(cA)) or np.any(np.isnan(cD)):
                     return None
                 return np.array([cA, cD])
@@ -178,7 +192,7 @@ def load_data_parallel(folder: str, max_files=MAX_FILES):
     return np.array(data)
 
 class DiffusionModel:
-    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, beta_schedule='linear'):
+    def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02, beta_schedule='cosine', s=0.008):
         self.timesteps = timesteps
 
         # 베타 스케줄 선택
@@ -190,10 +204,10 @@ class DiffusionModel:
             # cosine 스케줄 (Improved DDPM 논문 참조)
             steps = timesteps + 1
             x = np.linspace(0, timesteps, steps, dtype=np.float32)
-            alphas_cumprod = np.cos(((x / timesteps) + 0.008) / 1.008 * np.pi / 2) ** 2
+            alphas_cumprod = np.cos(((x / timesteps) + s) / (1 + s) * np.pi / 2) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            self.betas = np.clip(betas, 0, 0.999)
+            return np.clip(betas, 0, 0.999)
         else:
             self.betas = np.linspace(beta_start, beta_end, timesteps, dtype=np.float32)
 
@@ -237,7 +251,7 @@ class DiffusionModel:
         
         return sqrt_alphas_cumprod_t * x_0 + sqrt_one_minus_alphas_cumprod_t * noise
     
-    def p_losses(self, denoise_model, x_0, t, noise=None, loss_type="l2"):
+    def p_losses(self, denoise_model, x_0, t, noise=None, loss_type="huber"):
         """모델 학습을 위한 손실 함수"""
         if noise is None:
             noise = tf.random.normal(shape=tf.shape(x_0))
@@ -248,7 +262,7 @@ class DiffusionModel:
         if loss_type == "l1":
             loss = tf.reduce_mean(tf.abs(noise - predicted_noise))
         elif loss_type == "huber":
-            loss = tf.keras.losses.Huber(delta=1.0)(noise, predicted_noise)
+            loss = tf.keras.losses.Huber(delta=0.1)(noise, predicted_noise)
         else:  # l2
             loss = tf.reduce_mean(tf.square(noise - predicted_noise))
             
@@ -344,6 +358,7 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h)
         h_res = keras.layers.BatchNormalization()(h_res)
         h_res = keras.layers.Activation('swish')(h_res)
+        h_res = keras.layers.Dropout(0.1)(h_res)  # 10% 드롭아웃
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h_res)
         h_res = keras.layers.BatchNormalization()(h_res)
         
@@ -482,17 +497,17 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         # 모델 구축
         model = build_unet_model(
             input_shape=input_shape, 
-            time_embedding_dim=64, 
-            base_filters=32, 
-            depth=3, 
-            attention_res=[1, 2]
+            time_embedding_dim=128, 
+            base_filters=64, 
+            depth=4, 
+            attention_res=[1, 2, 3]
         )
         
         # 옵티마이저 및 학습률 스케줄러 설정
         lr_schedule = keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=1e-4,
+            initial_learning_rate=1e-5,
             decay_steps=epochs * (len(data) // batch_size),
-            alpha=0.1
+            alpha=0.01
         )
         optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
         model.compile(optimizer=optimizer, loss='mse')
@@ -501,34 +516,53 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             batch_data = tf.gather(samples, batch_indices)
             batch_data = tf.cast(batch_data, tf.float16)
             
-            t = tf.random.uniform(
-                shape=[batch_size], 
-                minval=0, 
-                maxval=timesteps, 
-                dtype=tf.int32
-            )
+            accumulated_gradients = None
+            num_accumulations = 4  # 4번 누적 (가상 배치 크기 = 4 * batch_size)
             
-            noise = tf.random.normal(shape=batch_data.shape, dtype=tf.float16)
-            x_noisy = diffusion.q_sample(batch_data, t, noise)
-            t_expanded = tf.expand_dims(t, -1)
+            # 그래디언트 누적
+            for i in range(num_accumulations):
+                # 각 배치 분할
+                start_idx = i * (batch_size // num_accumulations)
+                end_idx = (i + 1) * (batch_size // num_accumulations)
+                sub_batch = batch_data[start_idx:end_idx]
+                
+                t = tf.random.uniform(
+                    shape=[sub_batch.shape[0]], 
+                    minval=0, 
+                    maxval=timesteps, 
+                    dtype=tf.int32
+                )
+                
+                noise = tf.random.normal(shape=sub_batch.shape, dtype=tf.float16)
+                x_noisy = diffusion.q_sample(sub_batch, t, noise)
+                t_expanded = tf.expand_dims(t, -1)
+                
+                with tf.GradientTape() as tape:
+                    predicted_noise = model([x_noisy, t_expanded], training=True)
+                    loss = tf.reduce_mean(tf.square(noise - predicted_noise)) / num_accumulations
+                
+                gradients = tape.gradient(loss, model.trainable_variables)
+                
+                # 그래디언트 누적
+                if accumulated_gradients is None:
+                    accumulated_gradients = gradients
+                else:
+                    accumulated_gradients = [accu_grad + grad for accu_grad, grad in zip(accumulated_gradients, gradients)]
             
-            with tf.GradientTape() as tape:
-                predicted_noise = model([x_noisy, t_expanded], training=True)
-                loss = tf.reduce_mean(tf.square(noise - predicted_noise))
-            
-            gradients = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
-            return loss
+            # 클리핑 및 적용
+            accumulated_gradients, _ = tf.clip_by_global_norm(accumulated_gradients, clip_norm=1.0)
+            optimizer.apply_gradients(zip(accumulated_gradients, model.trainable_variables))
+            return loss * num_accumulations  # 원래 손실 크기로 반환
         
         if platform.system() == 'Darwin' and platform.processor() == 'arm':
             # Apple Silicon에서는 tf.function 데코레이터에서 jit_compile 비활성화
-            @tf.function(jit_compile=False)
+            @tf.function(jit_compile=False, reduce_retracing=True)
             def train_step(batch_indices):
                 per_replica_losses = strategy.run(train_step_fn, args=(batch_indices,))
                 return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
         else:
             # 다른 플랫폼에서는 jit_compile 활성화
-            @tf.function(jit_compile=True)
+            @tf.function(jit_compile=True, reduce_retracing=True)
             def train_step(batch_indices):
                 per_replica_losses = strategy.run(train_step_fn, args=(batch_indices,))
                 return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses, axis=None)
@@ -538,10 +572,17 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
     dataset = dataset.batch(batch_size, drop_remainder=True)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
+    warmup_epochs = 5
+    initial_lr = 1e-5
     # 학습 시작
     for epoch in range(epochs):
         logger.info(f"에포크 {epoch+1}/{epochs}")
-        
+        # 학습률 조정 (워밍업)
+        if epoch < warmup_epochs:
+        # 첫 5에포크 동안 학습률을 서서히 증가
+            lr = initial_lr * (epoch + 1) / warmup_epochs
+            keras.backend.set_value(optimizer.learning_rate, lr)
+
         # 사용자 정의 훈련 루프 실행
         epoch_loss = 0
         num_batches = 0
@@ -742,8 +783,10 @@ if __name__ == '__main__':
         logger.info("Apple Silicon 감지, Metal 최적화 적용 중...")
         try:
             # 혼합 정밀도 활성화
-            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
             # Metal 성능 향상을 위한 설정
+            os.environ['TF_METAL_ENABLED_GPU_COUNT'] = '1'  # GPU 수 설정
             os.environ['TF_METAL_DEVICE_FORCE_CPU'] = '0'  # Metal 사용
             os.environ['TF_METAL_DEBUG_ERROR_INSERTION'] = '0'  # 디버그 비활성화
             os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'  # 메모리 동적 할당
@@ -820,9 +863,9 @@ if __name__ == '__main__':
         sys.exit(1)
     elif sys.argv[1] == 'train':
         source_path = sys.argv[2] if len(sys.argv) > 2 else 'data/wav'
-        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 1000
-        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 64
+        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 200
+        epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 200
+        batch_size = int(sys.argv[5]) if len(sys.argv) > 5 else 256
         beta_schedule = sys.argv[6] if len(sys.argv) > 6 else 'cosine'
         
         logger.info(f"학습 시작: {source_path}, timesteps={steps}, epochs={epochs}, batch_size={batch_size}, beta_schedule={beta_schedule}")
