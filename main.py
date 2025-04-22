@@ -470,9 +470,21 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
     
     logger.info(f"데이터 형태: {data.shape}")
     
+    # 데이터 형태 확인 및 변환
+    if data.shape[1] == 2 and data.shape[2] > 1000:
+        # 필요한 변환: (samples, 2, width) -> (samples, width, 2)
+        data = np.transpose(data, (0, 2, 1))
+        logger.info(f"데이터 형태 변환 완료: {data.shape}")
+
     # 모델 설정
     diffusion = DiffusionModel(timesteps=timesteps, beta_schedule=beta_schedule)
-    input_shape = (data.shape[1], data.shape[2], 1)  # 채널 차원 추가
+    if len(data.shape) == 3:
+        input_shape = (data.shape[1], data.shape[2], 1)
+        data = np.expand_dims(data, axis=-1)
+    else:
+        input_shape = data.shape[1:]
+    
+    logger.info(f"입력 형태: {input_shape}")
     
     # 데이터를 올바른 형태로 변환 (채널 추가)
     data = np.expand_dims(data, axis=-1)
@@ -509,9 +521,18 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             decay_steps=epochs * (len(data) // batch_size),
             alpha=0.01
         )
-        optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
+        if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
+            # CUDA GPU에서 혼합 정밀도 사용
+            optimizer = keras.optimizers.Adam(learning_rate=lr_schedule, epsilon=1e-4)
+            logger.info("CUDA GPU용 옵티마이저 구성")
+        else:
+            optimizer = keras.optimizers.Adam(learning_rate=lr_schedule)
+
         model.compile(optimizer=optimizer, loss='mse')
     
+        # 모델 요약 출력
+        model.summary()
+        
         def train_step_fn(batch_indices):
             batch_data = tf.gather(samples, batch_indices)
             batch_data = tf.cast(batch_data, tf.float16)
@@ -572,6 +593,11 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
     dataset = dataset.batch(batch_size, drop_remainder=True)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
+    if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
+        # GPU 메모리 효율성을 위한 데이터 프리페치
+        batch_size = min(batch_size, 64)  # 메모리 오버플로우 방지
+        logger.info(f"CUDA 최적화: 배치 크기 {batch_size}로 조정")
+    
     warmup_epochs = 5
     initial_lr = 1e-5
     # 학습 시작
@@ -585,13 +611,68 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
 
         # 사용자 정의 훈련 루프 실행
         epoch_loss = 0
-        num_batches = 0
+        num_batches = len(samples) // batch_size
         
-        for batch_indices in tqdm(dataset, desc=f"Epoch {epoch+1}/{epochs}"):
-            loss = train_step(batch_indices)
-            epoch_loss += loss
-            num_batches += 1
+        # 배치 학습
+        for batch_idx in tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{epochs}"):
+            batch = samples[batch_idx*batch_size:(batch_idx+1)*batch_size]
+            batch = tf.convert_to_tensor(batch, dtype=tf.float32)
+
+            # 랜덤 타임스텝 선택
+            t = tf.random.uniform(
+                shape=[batch_size], 
+                minval=0, 
+                maxval=timesteps, 
+                dtype=tf.int32
+            )
+            
+            # 그래디언트 계산 및 적용
+            with tf.GradientTape() as tape:
+                noise = tf.random.normal(shape=batch.shape)
+                x_noisy = diffusion.q_sample(batch, t, noise)
+
+                t_expanded = tf.expand_dims(t, -1)
+                predicted_noise = model([x_noisy, t_expanded], training=True)
+                
+                # 예측 형태 확인 및 조정
+                if noise.shape != predicted_noise.shape:
+                    predicted_noise = tf.slice(
+                        predicted_noise, 
+                        [0, 0, 0, 0], 
+                        [batch_size, noise.shape[1], noise.shape[2], noise.shape[3]]
+                    )
+                
+                # 손실 계산 (L2 손실)
+                loss = tf.reduce_mean(tf.square(noise - predicted_noise))
+                
+                # 혼합 정밀도 스케일링 (필요한 경우)
+                if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
+                    if isinstance(optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+                        scaled_loss = optimizer.get_scaled_loss(loss)
+                    else:
+                        scaled_loss = loss
+                else:
+                    scaled_loss = loss
+            
+            # 그래디언트 적용
+            gradients = tape.gradient(scaled_loss, model.trainable_variables)
+            
+            # 혼합 정밀도 그래디언트 스케일링 (필요한 경우)
+            if tf.config.list_physical_devices('GPU') and not (platform.system() == 'Darwin' and platform.processor() == 'arm'):
+                if isinstance(optimizer, tf.keras.mixed_precision.LossScaleOptimizer):
+                    gradients = optimizer.get_unscaled_gradients(gradients)
+            
+            # 그래디언트 클리핑 (NaN 방지)
+            gradients = [tf.clip_by_norm(g, 1.0) if g is not None else g for g in gradients]
+            
+            optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+            total_loss += loss.numpy()
+            
+            # 메모리 정리 (선택적)
+            if batch_idx % 10 == 0 and tf.config.list_physical_devices('GPU'):
+                tf.keras.backend.clear_session()
         
+        # 에포크 종료 후 평균 손실 계산
         avg_loss = epoch_loss / num_batches
         logger.info(f"에포크 {epoch+1} 평균 손실: {avg_loss:.6f}")
         
@@ -777,6 +858,47 @@ def normalize_audio(samples, target_peak=0.9):
         samples = samples * gain
     return samples
 
+def configure_cuda():
+    """CUDA GPU 최적화 설정"""
+    try:
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            logger.info(f"NVIDIA GPU: {len(gpus)}개 발견, CUDA 최적화 적용 중...")
+            
+            # 메모리 자동 증가 허용
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            
+            # TensorFlow 메모리 할당자 설정
+            os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+            
+            # CUDA 컴파일 최적화
+            os.environ['TF_CUDA_NVCC_OPTIONS'] = '--use_fast_math'
+            os.environ['TF_XLA_FLAGS'] = '--tf_xla_auto_jit=2 --tf_xla_cpu_global_jit'
+            os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+            
+            # GPU 메모리 분할 비활성화 (단일 모델에서 더 효율적)
+            os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+            
+            # 혼합 정밀도 활성화
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+            tf.keras.mixed_precision.set_global_policy(policy)
+            logger.info("혼합 정밀도(mixed_float16) 활성화됨")
+            
+            # XLA 컴파일러 활성화
+            tf.config.optimizer.set_jit(True)
+            logger.info("XLA JIT 컴파일러 활성화됨")
+            
+            # NVIDIA GPU 최적화 완료
+            logger.info("CUDA 최적화 적용 완료")
+            return True
+        else:
+            logger.warning("NVIDIA GPU를 찾을 수 없습니다.")
+            return False
+    except Exception as e:
+        logger.error(f"CUDA 설정 중 오류 발생: {str(e)}")
+        return False
+
 if __name__ == '__main__':
     if platform.system() == 'Darwin' and platform.processor() == 'arm':
         # Apple Silicon 최적화
@@ -823,6 +945,11 @@ if __name__ == '__main__':
             logger.info(f"Apple Neural Engine 최적화 완료 (스레드: {num_threads})")
         except Exception as e:
             logger.warning(f"Apple Neural Engine 최적화 실패: {str(e)}")
+    elif platform.system() == 'Linux':
+        # Linux에서 NVIDIA GPU 확인 및 CUDA 최적화
+        cuda_available = configure_cuda()
+        if not cuda_available:
+            logger.warning("CUDA 최적화를 적용할 수 없습니다. 기본 GPU 설정을 사용합니다.")
     else:
         # 비 Apple 장치에서는 XLA 사용 가능
         tf.config.optimizer.set_jit(True)
