@@ -5,21 +5,20 @@ import numpy as np
 from scipy.spatial.distance import cosine
 import sys
 import os
-import json
 import random
 from tqdm import tqdm
-from text_embedding import adjust_embedding_dimension, setup_embedding_model, text_to_embedding, embedding_model, embed_dim, text_to_tokens
-
-fact_patterns = None
+from text_embedding import adjust_embedding_dimension, setup_embedding_model, text_to_embedding
 
 @keras.saving.register_keras_serializable(package="wavelet_music")
 class TransformerDenoiser(keras.Model):
     def __init__(self, embed_dim=512):
         super(TransformerDenoiser, self).__init__()
-        
+        self.embed_dim = embed_dim
         # 인코더 블록
         self.dense1 = layers.Dense(embed_dim * 2, activation='gelu')
         self.dense2 = layers.Dense(embed_dim * 2, activation='gelu')
+        
+        self.proj1 = layers.Dense(embed_dim, activation=None)
         
         # 어텐션 메커니즘
         self.attention = layers.MultiHeadAttention(
@@ -52,11 +51,14 @@ class TransformerDenoiser(keras.Model):
         x1 = self.dropout1(x1, training=training)
         x1 = self.dense2(x1)
         
+        # 셀프 어텐션 적용 전 차원 축소
+        x1_proj = self.proj1(x1)  # 1024 -> 512 차원으로 축소
+        
         # 셀프 어텐션 적용 (시퀀스 형태로 변환)
         if len(x1.shape) == 2:  # 배치 크기, 임베딩 차원
-            x1_seq = tf.expand_dims(x1, axis=1)  # 배치 크기, 시퀀스 길이(1), 임베딩 차원
+            x1_seq = tf.expand_dims(x1_proj, axis=1)  # 배치 크기, 시퀀스 길이(1), 임베딩 차원
         else:
-            x1_seq = x1
+            x1_seq = x1_proj
         
         attention_output = self.attention(x1_seq, x1_seq, x1_seq, training=training)
         
@@ -130,12 +132,8 @@ class AudioDiffusionConditioner(keras.Model):
         frequency = self.frequency_proj(features)
         volume = self.volume_proj(features)
         
-        # 오디오 토큰 출력
-        return {
-            'frequency': frequency,
-            'volume': volume,
-            'combined': tf.concat([frequency, volume], axis=-1)
-        }
+        # combined 텐서만 반환 (딕셔너리 대신)
+        return tf.concat([frequency, volume], axis=-1)
     
     def get_config(self):
         config = super(AudioDiffusionConditioner, self).get_config()
@@ -152,8 +150,6 @@ num_samples = 1000
 timesteps = 100
 
 def extract_fact_patterns():
-    global fact_patterns
-    
     fact_patterns = {
         "genre": [
             "is considered a pioneering work in the genre",
@@ -192,8 +188,7 @@ def extract_fact_patterns():
     
     return fact_patterns
 
-def find_similar_facts(embedding, top_k=3):
-    global reference_texts, reference_embeddings
+def find_similar_facts(embedding, reference_texts, reference_embeddings, top_k=3):
     
     if reference_embeddings is None or len(reference_embeddings) == 0:
         return ["No reference embeddings available"]
@@ -208,14 +203,9 @@ def find_similar_facts(embedding, top_k=3):
     
     return [reference_texts[idx] for idx in top_idxs]
 
-def creative_fact_generation(embedding: np.ndarray) -> str:
-    """임베딩을 기반으로 창의적인 음악 사실 생성"""
-    global fact_patterns
-    
-    if fact_patterns is None:
-        extract_fact_patterns()
-    
-    top_facts = find_similar_facts(embedding, top_k=3)
+def creative_fact_generation(embedding: np.ndarray, reference_texts, reference_embeddings, fact_patterns) -> str:
+    """임베딩을 기반으로 창의적인 음악 사실 생성""" 
+    top_facts = find_similar_facts(embedding, reference_texts, reference_embeddings, top_k=3)
     
     # 유사 사실이 없는 경우 대비
     if not top_facts or top_facts[0] == "No reference embeddings available":
@@ -255,19 +245,26 @@ def creative_fact_generation(embedding: np.ndarray) -> str:
     return new_fact
 
 def prepare_fine_tuning_data():
-    """파인튜닝 데이터 준비"""
+    """파인튜닝 데이터 준비 - 메모리 효율성 개선"""
     texts = []
     if os.path.exists("music_facts.txt"):
-        with open("music_facts.txt", "r", encoding="utf-8") as f:
-            texts = [line.strip() for line in f.readlines() if line.strip()]
-
-    global embedding_model
-    if embedding_model is None:
-        embedding_model = setup_embedding_model()
+        try:
+            with open("music_facts.txt", "r", encoding="utf-8") as file:
+                for line in file:
+                    if line.strip():
+                        texts.append(line.strip())
+            
+            print(f"로드된 텍스트 라인 수: {len(texts)}")
+        except Exception as e:
+            print(f"파일 로딩 중 오류 발생: {e}")
+            # 최소한의 샘플 데이터 제공
+            texts = ["Sample music fact for testing."]
+    
+    embedding_model = setup_embedding_model()
     embeddings = []
     
     for text in tqdm(texts):
-        embedding = text_to_embedding(text)
+        embedding = text_to_embedding(text, embedding_model)
         embeddings.append(embedding[0])
     embeddings = np.array(embeddings)
 
@@ -279,98 +276,160 @@ def prepare_fine_tuning_data():
 
     return x_train, y_train, texts
 
-def train(epochs=100, batch_size=1024):
-    """트랜스포머 디노이저 모델 학습"""
-    x_train, y_train, source_texts = prepare_fine_tuning_data()
+def train(epochs=100, batch_size=64, embed_dim=512):
+    """트랜스포머 디노이저 모델 학습 - 메모리 효율성 개선"""
+    try:
+        print("데이터 준비 중...")
+        # 데이터를 더 작은 청크로 로드하거나 처리
+        x_train, y_train, source_texts = prepare_fine_tuning_data()
+        
+        # 데이터 크기 체크
+        print(f"학습 데이터 크기: {len(x_train)} 샘플")
+        if len(x_train) == 0:
+            print("경고: 학습 데이터가 없습니다!")
+            return None, None, None
+        
+        # 메모리 사용량 출력 (선택적)
+        print(f"x_train 메모리: {x_train.nbytes / (1024 * 1024):.2f} MB")
+        print(f"y_train 메모리: {y_train.nbytes / (1024 * 1024):.2f} MB")
+        
+        actual_dim = x_train.shape[1]
+        if actual_dim != embed_dim:
+            print(f"경고: 입력 데이터 차원({actual_dim})과 지정된 embed_dim({embed_dim})이 일치하지 않습니다.")
+            print(f"embed_dim을 {actual_dim}으로 조정합니다.")
+            embed_dim = actual_dim
 
-    global reference_texts, reference_embeddings, embedding_model
-    reference_texts = source_texts
+        # 더 작은 배치 사이즈 및 학습률 조정
+        print("모델 컴파일 중...")
+        model = TransformerDenoiser(embed_dim)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-5),  # 더 낮은 학습률
+            loss="mse"
+        )
+        
+        # 메모리 정리
+        import gc
+        gc.collect()
+        
+        # 데이터 분할
+        split_idx = int(len(x_train) * 0.9)
+        x_val = x_train[split_idx:]
+        y_val = y_train[split_idx:]
+        x_train = x_train[:split_idx]
+        y_train = y_train[:split_idx]
+        
+        # 학습 콜백 설정
+        callbacks = [
+            tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss', 
+                factor=0.5, 
+                patience=5, 
+                min_lr=1e-6
+            ),
+            tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                restore_best_weights=True
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                filepath="music_fact_generator_checkpoint",
+                save_best_only=True,
+                monitor='val_loss'
+            )
+        ]
+        
+        # 메모리에 맞게 학습 수행
+        print(f"모델 학습 시작 (배치 크기: {batch_size}, 에폭: {epochs})...")
+        history = model.fit(
+            x_train, y_train,
+            validation_data=(x_val, y_val),
+            epochs=epochs,
+            batch_size=batch_size,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        print("기본 모델 저장 중...")
+        model.save("music_fact_generator", save_format='tf')
+        
+        # 메모리 정리
+        del x_train, y_train, x_val, y_val
+        gc.collect()
+        
+        # 오디오 조건부 모델 학습 - 더 단순하게 수정
+        print("오디오 조건부 모델 학습 시작...")
+        conditioner = AudioDiffusionConditioner(
+            text_embed_dim=embed_dim,
+            audio_token_dim=256,
+            frequency_dim=1024,
+            volume_dim=128
+        )
+        
+        conditioner.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=1e-4),
+            loss="mse"
+        )
+        
+        # 보다 효율적인 샘플 수 계산
+        sample_size = min(500, len(source_texts))  # 최대 500개 샘플만 사용
+        
+        # 작은 더미 데이터로 간단하게 학습
+        dummy_x = np.random.randn(sample_size, embed_dim).astype(np.float32)
+        dummy_targets = np.random.randn(sample_size, 1024 + 128).astype(np.float32)
+        
+        # 더 작은 배치와 에폭으로 학습
+        print("조건부 모델 간단 학습 중...")
+        conditioner.fit(
+            dummy_x, 
+            dummy_targets,
+            batch_size=batch_size,
+            epochs=100
+        )
+        
+        conditioner.save("audio_conditioner", save_format='tf')
+        print("오디오 조건부 모델 저장 완료")
+        
+        return model, history, conditioner
+        
+    except tf.errors.ResourceExhaustedError as e:
+        print(f"메모리 부족 오류: {e}")
+        print("더 작은 배치 크기로 다시 시도해보세요 (예: --batch_size 32)")
+        return None, None, None
+    except Exception as e:
+        print(f"학습 중 오류 발생: {e}")
+        return None, None, None
 
-    if embedding_model is None:
-        embedding_model = setup_embedding_model()
-    
-    raw_embeddings = embedding_model.encode(reference_texts)
-    reference_embeddings = adjust_embedding_dimension(raw_embeddings, embed_dim)
-
-    extract_fact_patterns()
-
-    model = TransformerDenoiser(embed_dim)
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=5e-5),
-        loss="mse"
-    )
-
-    split_idx = int(len(x_train) * 0.9)
-    x_val = x_train[split_idx:]
-    y_val = y_train[split_idx:]
-    x_train = x_train[:split_idx]
-    y_train = y_train[:split_idx]
-
-    history = model.fit(
-        x_train, y_train,
-        validation_data=(x_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size
-    )
-
-    model.save("music_fact_generator.keras")
-    
-    # 오디오 조건부 모델 학습 (선택적)
-    print("오디오 조건부 모델 학습 시작...")
-    conditioner = AudioDiffusionConditioner(
-        text_embed_dim=embed_dim,
-        audio_token_dim=256,
-        frequency_dim=1024,
-        volume_dim=128
-    )
-    
-    conditioner.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=1e-4),
-        loss="mse"
-    )
-    
-    # 임의의 타겟 데이터 생성 (실제로는 오디오 특성이 필요)
-    dummy_targets = {
-        'frequency': np.random.randn(len(x_train), 1024).astype(np.float32),
-        'volume': np.random.rand(len(x_train), 128).astype(np.float32),
-        'combined': np.random.randn(len(x_train), 1024 + 128).astype(np.float32)
-    }
-    
-    # 조건부 모델 간단 학습 (실제 구현 시 적절한 데이터 필요)
-    conditioner.fit(
-        x_train, 
-        dummy_targets['combined'],
-        batch_size=batch_size,
-        epochs=5  # 짧게 학습
-    )
-    
-    conditioner.save("audio_conditioner.keras")
-    print("오디오 조건부 모델 저장됨: audio_conditioner.keras")
-    
-    return model, history, conditioner
-
-def generate(text_input: str, model_path="music_fact_generator.keras", steps=10) -> str:
+def generate(text_input: str, model_path="music_fact_generator", steps=10, embed_dim=512) -> str:
     """텍스트 생성 기능"""
     loaded_model = keras.models.load_model(
         model_path, 
         custom_objects={"TransformerDenoiser": TransformerDenoiser}
     )
-    input_embedding = text_to_embedding(text_input)
+    embedding_model = setup_embedding_model()
+    input_embedding = text_to_embedding(text_input, embedding_model)
     noise_level = 0.5
     noisy_embedding = input_embedding + noise_level * np.random.randn(*input_embedding.shape)
 
+    x_train, y_train, source_texts = prepare_fine_tuning_data()
+    reference_texts = source_texts
+    
+    raw_embeddings = embedding_model.encode(reference_texts)
+    reference_embeddings = adjust_embedding_dimension(raw_embeddings, embed_dim)
+    fact_pattern = extract_fact_patterns()
+    
     current_embedding = noisy_embedding
     for i in range(steps):
         current_embedding = loaded_model.predict(current_embedding, verbose=0)
         if (i+1) % 2 == 0 or i == steps-1:
-            creative_fact_generation(current_embedding)
+            creative_fact_generation(current_embedding, reference_texts, reference_embeddings, fact_pattern)
     
-    return creative_fact_generation(current_embedding)
+    return creative_fact_generation(current_embedding, reference_texts, reference_embeddings, fact_pattern)
 
-def generate_audio_seeds(text_input: str, conditioner_path="audio_conditioner.keras", num_seeds=3):
+def generate_audio_seeds(text_input: str, conditioner_path="audio_conditioner", num_seeds=3):
     """텍스트 입력에서 오디오 시드 생성"""
     # 텍스트 임베딩
-    input_embedding = text_to_embedding(text_input)
+    empedding_model = setup_embedding_model()
+    input_embedding = text_to_embedding(text_input, empedding_model)
     
     # 조건부 모델 로드
     try:
@@ -390,7 +449,17 @@ def generate_audio_seeds(text_input: str, conditioner_path="audio_conditioner.ke
         noisy_embedding = input_embedding + noise
         
         # 조건부 특성 생성
-        audio_tokens = conditioner.predict(noisy_embedding)
+        combined_features = conditioner.predict(noisy_embedding)
+        
+        # 결과 분할하여 딕셔너리로 변환
+        frequency = combined_features[:, :1024]
+        volume = combined_features[:, 1024:]
+        
+        audio_tokens = {
+            'frequency': frequency,
+            'volume': volume,
+            'combined': combined_features
+        }
         
         # 결과 저장
         seeds.append(audio_tokens)
@@ -398,9 +467,9 @@ def generate_audio_seeds(text_input: str, conditioner_path="audio_conditioner.ke
     return seeds
 
 def combined_text_audio(text_input: str, 
-                      text_model_path="music_fact_generator.keras",
-                      audio_model_path="text_to_audio_model.keras",
-                      diffusion_model_path="diffusion_model.keras",
+                      text_model_path="music_fact_generator",
+                      audio_model_path="text_to_audio_model",
+                      diffusion_model_path="diffusion_model",
                       output_path="generated.wav",
                       steps=10):
     """텍스트와 오디오 생성 통합 함수"""
@@ -413,6 +482,14 @@ def combined_text_audio(text_input: str,
     # 2. 오디오 시드 생성
     seeds = generate_audio_seeds(generated_fact, num_seeds=1)
     
+    # 오디오 시드가 None인 경우 처리 추가
+    if seeds is None:
+        print("오디오 시드 생성 실패")
+        return {
+            'text': generated_fact,
+            'error': "오디오 시드 생성 실패, 조건부 모델을 로드할 수 없습니다."
+        }
+    
     # 3. 텍스트-오디오 모델로 오디오 생성
     from text_to_audio import generate_audio_from_text
     
@@ -422,7 +499,8 @@ def combined_text_audio(text_input: str,
             generated_fact,
             tokenizer_model_path=audio_model_path,
             diffusion_model_path=diffusion_model_path,
-            output_path=output_path
+            output_path=output_path,
+            audio_seeds=seeds[0] if seeds else None  # seeds가 비어있지 않은 경우에만 첫 번째 시드 사용
         )
         
         print(f"오디오 생성 완료: {output_path}")
@@ -443,7 +521,7 @@ if __name__ == "__main__":
     reference_embeddings = None
     
     if len(sys.argv) < 2:
-        print("Usage: python script.py [train|generate] [TEXT(optional)]")
+        print("Usage: python diffusion_text.py [train|generate] [TEXT(optional)]")
         sys.exit(1)
     
     # 사용 가능한 장치 확인
@@ -456,18 +534,47 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"GPU 설정 오류: {e}")
     
-    # 모델 학습 또는 생성
-    if sys.argv[1] == 'train':
-        model, history, _ = train(epochs=100, batch_size=32)
-        print("모델 학습 완료")
-    elif sys.argv[1] == 'generate':
-        if len(sys.argv) < 3:
-            text_input = "electronic music with complex rhythms"
-        else:
-            text_input = sys.argv[2]
+    # 메모리 제한 설정
+    try:
+        # TensorFlow 메모리 사용량 제한
+        physical_devices = tf.config.list_physical_devices('GPU')
+        if physical_devices:
+            tf.config.set_logical_device_configuration(
+                physical_devices[0],
+                [tf.config.LogicalDeviceConfiguration(memory_limit=4096)]  # 4GB 제한
+            )
+    except Exception as e:
+        print(f"메모리 제한 설정 오류: {e}")
+    
+    # 오류 처리 및 예외 핸들링 강화
+    try:
+        # 모델 학습 또는 생성
+        if sys.argv[1] == 'train':
+            try:
+                model, history, _ = train(epochs=100, batch_size=256)
+                print("모델 학습 완료")
+            except Exception as e:
+                print(f"학습 중 오류 발생: {e}")
+                sys.exit(1)
+        elif sys.argv[1] == 'generate':
+            if len(sys.argv) < 3:
+                print("텍스트 입력이 필요합니다.")
+                sys.exit(1)
+            else:
+                text_input = sys.argv[2]
             
-        output = combined_text_audio(text_input)
-        print(f"생성 결과: {output['text']}")
-    else:
-        print("알 수 없는 명령: " + sys.argv[1])
-        print("사용법: python script.py [train|generate] [TEXT(optional)]")
+            try:
+                output = combined_text_audio(text_input)
+                if 'error' in output:
+                    print(f"생성 오류: {output['error']}")
+                else:
+                    print(f"생성 결과: {output['text']}")
+            except Exception as e:
+                print(f"생성 중 오류 발생: {e}")
+                sys.exit(1)
+        else:
+            print("알 수 없는 명령: " + sys.argv[1])
+            print("사용법: python diffusion_text.py [train|generate] [TEXT(optional)]")
+    except Exception as e:
+        print(f"실행 중 예상치 못한 오류 발생: {e}")
+        sys.exit(1)

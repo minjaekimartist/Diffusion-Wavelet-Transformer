@@ -2,11 +2,10 @@ import numpy as np
 import tensorflow as tf
 import keras
 from keras import layers
-import os
 import json
 import pywt
 from tqdm import tqdm
-from text_embedding import text_to_embedding, adjust_embedding_dimension, embed_dim
+from text_embedding import text_to_embedding, adjust_embedding_dimension
 
 class TextToAudioTokenizer(keras.Model):
     """텍스트를 오디오 토큰으로 변환하는 트랜스포머 모델"""
