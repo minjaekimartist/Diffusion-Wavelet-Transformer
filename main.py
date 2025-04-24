@@ -1078,29 +1078,6 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None, t
         params = {'timesteps': 1000}
         beta_schedule = 'linear'
     
-    # 텍스트 임베딩 사용 (선택적)
-    text_embedding = None
-    if text_description:
-        try:
-            # 텍스트 임베딩 로드
-            from text_embedding import text_to_embedding
-            text_embedding = text_to_embedding(text_description)
-            logger.info(f"텍스트 임베딩 생성 완료: {text_description}")
-            
-            # 텍스트-음악 조건부 모듈 로드 (diffusion_text.py)
-            try:
-                from diffusion_text import AudioDiffusionConditioner
-                conditioner = keras.models.load_model(
-                    'audio_conditioner.keras',
-                    custom_objects={"AudioDiffusionConditioner": AudioDiffusionConditioner}
-                )
-                audio_tokens = conditioner.predict(text_embedding)
-                logger.info("텍스트 조건부 오디오 특성 생성 완료")
-            except Exception as e:
-                logger.warning(f"텍스트 조건부 모듈 로드 실패: {str(e)}")
-        except Exception as e:
-            logger.warning(f"텍스트 임베딩 생성 실패: {str(e)}")
-    
     # 디퓨전 모델 초기화
     diffusion = DiffusionModel(timesteps=params['timesteps'], beta_schedule=beta_schedule)
     diffusion.betas = np.array(params['betas'], dtype=np.float32)
@@ -1144,31 +1121,16 @@ def generate_from_text(text_description, output_path='generated_from_text.wav', 
     # 텍스트-오디오 변환 모듈 가져오기
     try:
         from diffusion_text import combined_text_audio
-        
-        logger.info(f"텍스트 기반 오디오 생성 시작: '{text_description}'")
-        
-        # 먼저 diffusion_text.py의 combined_text_audio 함수 시도
-        try:
-            result = combined_text_audio(
-                text_description,
-                output_path=output_path,
-                steps=10
-            )
-            if 'error' not in result:
-                logger.info(f"텍스트에서 오디오 생성 완료: {output_path}")
-                return result
-            else:
-                logger.warning(f"combined_text_audio 실패: {result.get('error')}")
-        except Exception as e:
-            logger.warning(f"combined_text_audio 함수 실행 실패: {str(e)}")
-        
-        # 대체 방법: 직접 텍스트 임베딩을 사용해 생성
-        return generate_audio(output_path=output_path, steps=steps, eta=eta, text_description=text_description)
-        
+        seeds = combined_text_audio(text_description)
+        if seeds is not None:
+            logger.info(f"텍스트 기반 오디오 생성 시작: '{text_description}'")
+            return generate_audio(output_path=output_path, steps=steps, eta=eta, seed=seeds[0], text_description=text_description)
+        else:
+            logger.error("텍스트 기반 오디오 생성 실패: 유효한 시드 없음")
+            return None
     except ImportError:
-        logger.warning("text_to_audio 모듈을 가져올 수 없습니다. 텍스트 임베딩만 사용합니다.")
-        # 텍스트 임베딩을 사용한 일반 생성으로 대체
-        return generate_audio(output_path=output_path, steps=steps, eta=eta, text_description=text_description)
+        logger.warning("text_to_audio 모듈을 가져올 수 없습니다. 텍스트 기반 생성 기능을 사용할 수 없습니다.")
+        return None
 
 if __name__ == '__main__':
     # 장치 설정
@@ -1192,8 +1154,8 @@ if __name__ == '__main__':
         train(source_path, timesteps=steps, epochs=epochs, batch_size=batch_size, beta_schedule=beta_schedule)
     elif sys.argv[1] == 'generate':
         output_path = sys.argv[2] if len(sys.argv) > 2 else 'generated.wav'
-        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 5
-        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 0
+        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 30
         seed = int(sys.argv[5]) if len(sys.argv) > 5 else None
         
         logger.info(f"생성 시작: {output_path}, steps={steps}, eta={eta}, seed={seed}")
@@ -1211,13 +1173,32 @@ if __name__ == '__main__':
             
         text = sys.argv[2]
         output_path = sys.argv[3] if len(sys.argv) > 3 else 'generated_from_text.wav'
-        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 50
-        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 0.3
+        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 30
         
         logger.info(f"텍스트 기반 생성 시작: '{text}'")
         result = generate_from_text(text, output_path=output_path, steps=steps, eta=eta)
         
         if result and 'path' in result:
+            logger.info(f"텍스트 기반 생성 완료: {result['path']}")
+        else:
+            logger.error("텍스트 기반 생성 실패")
+    elif sys.argv[1] == 'transform2audio':
+        from text_to_audio import generate_audio_from_text
+        if len(sys.argv) < 3:
+            print("텍스트 설명이 필요합니다.")
+            print("사용법: python main.py transform2audio [text] [output_path] [steps] [eta]")
+            sys.exit(1)
+            
+        text = sys.argv[2]
+        output_path = sys.argv[3] if len(sys.argv) > 3 else 'generated_from_text.wav'
+        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
+        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 30
+        
+        logger.info(f"텍스트 기반 생성 시작: '{text}'")
+        result = generate_audio_from_text(text, tokenizer_model_path='text_to_audio_model', diffusion_model_path='diffusion_model', output_path=output_path, steps=steps, eta=eta)
+        
+        if result:
             logger.info(f"텍스트 기반 생성 완료: {result['path']}")
         else:
             logger.error("텍스트 기반 생성 실패")

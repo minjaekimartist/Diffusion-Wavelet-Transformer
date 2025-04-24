@@ -489,32 +489,7 @@ def combined_text_audio(text_input: str,
             'text': generated_fact,
             'error': "오디오 시드 생성 실패, 조건부 모델을 로드할 수 없습니다."
         }
-    
-    # 3. 텍스트-오디오 모델로 오디오 생성
-    from text_to_audio import generate_audio_from_text
-    
-    try:
-        # 텍스트에서 오디오 생성
-        audio_samples = generate_audio_from_text(
-            generated_fact,
-            tokenizer_model_path=audio_model_path,
-            diffusion_model_path=diffusion_model_path,
-            output_path=output_path,
-            audio_seeds=seeds[0] if seeds else None  # seeds가 비어있지 않은 경우에만 첫 번째 시드 사용
-        )
-        
-        print(f"오디오 생성 완료: {output_path}")
-        return {
-            'text': generated_fact,
-            'audio_path': output_path,
-            'audio_samples': audio_samples
-        }
-    except Exception as e:
-        print(f"오디오 생성 오류: {e}")
-        return {
-            'text': generated_fact,
-            'error': str(e)
-        }
+    return seeds
 
 if __name__ == "__main__":
     reference_texts = []
@@ -565,10 +540,6 @@ if __name__ == "__main__":
             
             try:
                 output = combined_text_audio(text_input)
-                if 'error' in output:
-                    print(f"생성 오류: {output['error']}")
-                else:
-                    print(f"생성 결과: {output['text']}")
             except Exception as e:
                 print(f"생성 중 오류 발생: {e}")
                 sys.exit(1)

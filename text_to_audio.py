@@ -3,9 +3,9 @@ import tensorflow as tf
 import keras
 from keras import layers
 import json
-import pywt
 from tqdm import tqdm
 from text_embedding import text_to_embedding, adjust_embedding_dimension
+from main import Data
 
 class TextToAudioTokenizer(keras.Model):
     """텍스트를 오디오 토큰으로 변환하는 트랜스포머 모델"""
@@ -133,73 +133,6 @@ class TransformerBlock(layers.Layer):
         })
         return config
 
-@keras.saving.register_keras_serializable()
-class WaveletAudioProcessor:
-    """오디오 웨이블릿 처리를 위한 클래스"""
-    
-    def __init__(self, wavelet_type='db4', max_freq=20000, sample_rate=44100, frame_size=2048):
-        self.wavelet_type = wavelet_type
-        self.max_freq = max_freq
-        self.sample_rate = sample_rate
-        self.frame_size = frame_size
-    
-    def audio_to_wavelet(self, audio_data):
-        """오디오를 웨이블릿 변환"""
-        if len(audio_data.shape) > 1:  # 스테레오 처리
-            # 스테레오를 모노로 변환 (평균)
-            audio_data = np.mean(audio_data, axis=1)
-        
-        # 프레임 분할
-        num_frames = len(audio_data) // self.frame_size
-        wavelet_features = []
-        
-        for i in range(num_frames):
-            frame = audio_data[i * self.frame_size:(i + 1) * self.frame_size]
-            # 웨이블릿 변환
-            coeffs = pywt.wavedec(frame, self.wavelet_type, level=5)
-            # 계수 연결 및 정규화
-            feature = np.concatenate([np.abs(c) for c in coeffs])
-            feature = feature / (np.max(feature) + 1e-8)  # 0-1 사이로 정규화
-            wavelet_features.append(feature)
-        
-        return np.array(wavelet_features)
-    
-    def wavelet_to_audio(self, wavelet_features):
-        """웨이블릿 특성을 오디오로 변환"""
-        # 주파수 대역별 계수 분리 
-        level = 5
-        audio_frames = []
-        
-        for feature in wavelet_features:
-            # 계수 추출 및 복원
-            coeffs = []
-            start_idx = 0
-            
-            # 각 레벨의 계수 길이 계산
-            approx_len = self.frame_size // (2 ** level)
-            coeffs.append(feature[:approx_len])
-            start_idx += approx_len
-            
-            for i in range(level):
-                detail_len = self.frame_size // (2 ** (level - i))
-                coeffs.append(feature[start_idx:start_idx + detail_len])
-                start_idx += detail_len
-            
-            # 역변환
-            reconstructed = pywt.waverec(coeffs, self.wavelet_type)
-            # 길이 조정
-            if len(reconstructed) >= self.frame_size:
-                reconstructed = reconstructed[:self.frame_size]
-            else:
-                padding = np.zeros(self.frame_size - len(reconstructed))
-                reconstructed = np.concatenate([reconstructed, padding])
-            
-            audio_frames.append(reconstructed)
-        
-        # 프레임 연결
-        audio_data = np.concatenate(audio_frames)
-        return audio_data
-
 def build_text_to_audio_model(diffusion_model_path, text_embed_dim=512, 
                              frequency_dim=1024, volume_dim=128, time_dim=2048,
                              frame_size=2048):
@@ -247,19 +180,12 @@ def train_text_to_audio(text_data, audio_files, epochs=100, batch_size=16, model
     text_embeddings = np.array(text_embeddings)
     
     # 오디오 데이터 처리
-    processor = WaveletAudioProcessor()
     audio_features = []
     
     for audio_file in tqdm(audio_files, desc="오디오 특성 추출"):
         try:
-            # 오디오 파일 로드
-            audio_data, _ = tf.audio.decode_wav(
-                tf.io.read_file(audio_file), desired_channels=1
-            )
-            audio_data = tf.squeeze(audio_data).numpy()
-            
             # 웨이블릿 변환
-            features = processor.audio_to_wavelet(audio_data)
+            features = Data(audio_file).transform()
             audio_features.append(features)
         except Exception as e:
             print(f"오디오 파일 처리 오류 {audio_file}: {e}")
@@ -272,7 +198,7 @@ def train_text_to_audio(text_data, audio_files, epochs=100, batch_size=16, model
     
     # 모델 구축
     model = build_text_to_audio_model(
-        diffusion_model_path="diffusion_model.keras",
+        diffusion_model_path="diffusion_model",
         text_embed_dim=512,
         frequency_dim=1024,
         volume_dim=128,
@@ -310,30 +236,52 @@ def train_text_to_audio(text_data, audio_files, epochs=100, batch_size=16, model
 def generate_audio_from_text(text, tokenizer_model_path, diffusion_model_path, 
                            diffusion_params_path="diffusion_params.json",
                            output_path="generated.wav",
-                           sample_rate=44100):
+                           sample_rate=48000):
     """텍스트로부터 오디오 생성"""
     # 텍스트 임베딩
     text_embedding = text_to_embedding(text)
     text_embedding = adjust_embedding_dimension(text_embedding, target_dim=512)
     
+    # 배치 차원 확인 및 조정 (모델 입력에 맞게)
+    if len(text_embedding.shape) == 2:
+        # 이미 배치 형태
+        pass
+    else:
+        # 단일 임베딩을 배치로 변환
+        text_embedding = np.expand_dims(text_embedding, axis=0)
+    
     # 토크나이저 모델 로드
-    tokenizer_model = keras.models.load_model(
-        tokenizer_model_path,
-        custom_objects={
-            "TextToAudioTokenizer": TextToAudioTokenizer,
-            "TransformerBlock": TransformerBlock
-        }
-    )
+    try:
+        tokenizer_model = keras.models.load_model(
+            tokenizer_model_path,
+            custom_objects={
+                "TextToAudioTokenizer": TextToAudioTokenizer,
+                "TransformerBlock": TransformerBlock
+            }
+        )
+        
+        # 텍스트에서 오디오 토큰 생성
+        audio_tokens = tokenizer_model.predict(text_embedding)
+        
+    except Exception as e:
+        print(f"토크나이저 모델 로드 또는 예측 오류: {e}")
+        return None
     
-    # 텍스트에서 오디오 토큰 생성
-    audio_tokens = tokenizer_model.predict(text_embedding)
-    
-    # 디퓨전 모델 로드
+    # 디퓨전 모델 및 유틸리티 함수 로드
     from main import DiffusionModel, sample_from_diffusion, inverse_transform, save_audio
     
-    # 디퓨전 파라미터 로드
-    with open(diffusion_params_path, 'r') as f:
-        params = json.load(f)
+    # 디퓨전 파라미터 로드 (예외 처리 추가)
+    try:
+        with open(diffusion_params_path, 'r') as f:
+            params = json.load(f)
+    except FileNotFoundError:
+        print(f"디퓨전 파라미터 파일을 찾을 수 없습니다: {diffusion_params_path}")
+        # 기본 파라미터 설정
+        params = {'timesteps': 1000, 'beta_schedule': 'linear'}
+    except json.JSONDecodeError:
+        print(f"디퓨전 파라미터 파일 형식이 잘못되었습니다: {diffusion_params_path}")
+        # 기본 파라미터 설정
+        params = {'timesteps': 1000, 'beta_schedule': 'linear'}
     
     # 디퓨전 모델 초기화
     diffusion = DiffusionModel(
@@ -350,21 +298,46 @@ def generate_audio_from_text(text, tokenizer_model_path, diffusion_model_path,
         diffusion.alphas_cumprod = np.array(params['alphas_cumprod'], dtype=np.float32)
         diffusion.alphas_cumprod_prev = np.append(np.float32(1.0), diffusion.alphas_cumprod[:-1])
     
+    # 추가 필요한 파라미터 계산
+    if not hasattr(diffusion, 'sqrt_alphas_cumprod') or diffusion.sqrt_alphas_cumprod is None:
+        diffusion.sqrt_alphas_cumprod = np.sqrt(diffusion.alphas_cumprod).astype(np.float32)
+    if not hasattr(diffusion, 'sqrt_one_minus_alphas_cumprod') or diffusion.sqrt_one_minus_alphas_cumprod is None:
+        diffusion.sqrt_one_minus_alphas_cumprod = np.sqrt(1. - diffusion.alphas_cumprod).astype(np.float32)
+    
     # 디퓨전 모델 로드
-    diffusion_model = keras.models.load_model(diffusion_model_path)
+    try:
+        diffusion_model = keras.models.load_model(diffusion_model_path)
+    except Exception as e:
+        print(f"디퓨전 모델 로드 오류: {e}")
+        return None
     
     # 오디오 토큰으로부터 웨이블릿 데이터 생성
+    # 샘플링을 위한 shape 설정 (주의: audio_tokens의 형태를 사용)
+    print(f"오디오 토큰 형태: {audio_tokens.shape}")
+    
     # 샘플링
-    shape = audio_tokens.shape
-    generated = sample_from_diffusion(
-        diffusion_model, diffusion, shape, steps=100, eta=0.3, num_samples=1
-    )
-    
-    # 웨이블릿 역변환
-    audio_samples = inverse_transform(generated.numpy())
-    
-    # 오디오 저장
-    save_audio(audio_samples, output_path, sample_rate=sample_rate)
-    
-    print(f"오디오 생성 완료: {output_path}")
-    return audio_samples
+    try:
+        # 합리적인 스텝 수와 노이즈 비율 적용
+        steps = 100
+        eta = 0.3
+        
+        generated = sample_from_diffusion(
+            diffusion_model, diffusion, audio_tokens.shape, 
+            steps=steps, eta=eta, num_samples=1
+        )
+        
+        # 웨이블릿 역변환
+        audio_samples = inverse_transform(generated.numpy())
+        
+        # 오디오 저장 
+        if audio_samples is not None and len(audio_samples) > 0:
+            save_audio(audio_samples, output_path, sample_rate=sample_rate)
+            print(f"오디오 생성 완료: {output_path}")
+            return audio_samples
+        else:
+            print("오디오 생성 실패: 유효한 샘플이 생성되지 않았습니다.")
+            return None
+            
+    except Exception as e:
+        print(f"오디오 생성 중 오류 발생: {e}")
+        return None
