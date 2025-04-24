@@ -236,7 +236,7 @@ def train_text_to_audio(text_data, audio_files, epochs=100, batch_size=16, model
 def generate_audio_from_text(text, tokenizer_model_path, diffusion_model_path, 
                            diffusion_params_path="diffusion_params.json",
                            output_path="generated.wav",
-                           sample_rate=48000):
+                           sample_rate=48000, steps=100, eta=30):
     """텍스트로부터 오디오 생성"""
     # 텍스트 임베딩
     text_embedding = text_to_embedding(text)
@@ -317,10 +317,6 @@ def generate_audio_from_text(text, tokenizer_model_path, diffusion_model_path,
     
     # 샘플링
     try:
-        # 합리적인 스텝 수와 노이즈 비율 적용
-        steps = 100
-        eta = 0.3
-        
         generated = sample_from_diffusion(
             diffusion_model, diffusion, audio_tokens.shape, 
             steps=steps, eta=eta, num_samples=1
