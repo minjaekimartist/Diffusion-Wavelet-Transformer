@@ -1,0 +1,210 @@
+\documentclass[12pt]{report}
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{cite}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  language=Python
+}
+
+\begin{document}
+
+\title{Diffusion-Wavelet-Transformer (DWT) Model for High-Fidelity Music Generation}
+\author{Minjae Kim}
+\date{\today}
+\maketitle
+
+\begin{abstract}
+This thesis presents a novel \emph{Diffusion-Wavelet-Transformer} (DWT) framework for generating high-quality, text-conditioned music. By replacing spectrogram‐based STFT with multi-resolution wavelet transforms and leveraging a U-Net diffusion backbone guided by a transformer encoder, DWT addresses phase artifacts and frequency-resolution trade-offs found in prior systems like Riffusion \cite{ForsgrenMartiros2022,Rombach2022}. We detail the data processing pipeline, neural architecture, diffusion schedules, training optimizations, and generation workflow-including a transformer-based text-to-audio tokenizer-and demonstrate robust audio reconstruction via inverse DWT.
+\end{abstract}
+
+\tableofcontents
+
+\chapter{Introduction}
+
+Generative adversarial networks (GANs) pioneered deep generative modeling for audio \cite{Goodfellow2014} but often struggle with stability and mode collapse. Diffusion models adapted to spectrogram images-e.g.\ Riffusion-offer a promising alternative yet suffer from phase discontinuities and attenuated low/high bands due to limitations of the STFT representation \cite{ForsgrenMartiros2022}\cite{Rombach2022}. We hypothesize these issues originate from (i) STFT’s inability to encode phase, and (ii) its fixed time-frequency resolution. To overcome these, we propose the DWT model, which (a) applies discrete wavelet transforms for multi-resolution decomposition, and (b) conditions a U-Net diffusion denoiser on text prompts via a transformer encoder.
+
+\chapter{Background}
+
+\section{Wavelet Transforms in Audio}
+Discrete wavelet transforms (DWT) provide a multi‐resolution decomposition of a signal into approximation and detail coefficients, yielding higher frequency resolution at low bands and better time resolution at high bands.  The mathematical framework of multiresolution analysis (MRA) was formalized by Mallat, who showed how to implement the DWT efficiently via a pyramidal filter‐bank algorithm \cite{Mallat1989}.  Daubechies then constructed the first family of \emph{compactly supported} orthonormal wavelets-now known as Daubechies “db$N$” wavelets-which admit fast, finite-impulse-response implementation and excellent regularity properties \cite{Daubechies1988}.  We use the ‘db4’ variant for its balance of time-frequency localization in audio.
+\section{Diffusion Models}
+Denoising Diffusion Probabilistic Models (DDPM) define a forward noising and reverse denoising process \cite{Ho2020}. Improved cosine noise schedules-with small offset $s=0.008$-achieve smoother sample trajectories \cite{NicholDhariwal2021}.
+
+\section{Transformers for Prompt Conditioning}
+Transformers capture long-range dependencies via self-attention \cite{Vaswani2017}. Recent works such as MusicLM adapt transformers to generate audio tokens from text \cite{Agostinelli2023}.
+
+\chapter{Model Architecture}
+
+\section{Data Processing}
+
+\begin{itemize}
+  \item \textbf{Frame Segmentation}: WAV files are loaded, decoded to 32-bit floats, and segmented into fixed-length frames of \(\text{sample\_size}=2048\) samples.
+  \item \textbf{Data Augmentation}: Each segment undergoes
+    \begin{itemize}
+      \item \emph{Noise} injection (10\% probability, $\sigma\in[0.001,0.01]$).
+      \item \emph{Random gain} scaling (20\% probability, gain $\in[0.8,1.2]$).
+    \end{itemize}
+  \item \textbf{Wavelet Decomposition}: Each segment is decomposed via \texttt{pywt.dwt(..., 'db4')} into approximation \(cA\) and detail \(cD\) coefficients, then normalized:
+    \[
+      cA \leftarrow \frac{cA - \mu_{cA}}{\sigma_{cA} + 10^{-8}}, \quad
+      cD \leftarrow \frac{cD - \mu_{cD}}{\sigma_{cD} + 10^{-8}}
+    \]
+  \item \textbf{Caching \& Parallelization}:  
+    \begin{itemize}
+      \item \emph{File‐level} and \emph{folder‐level} caching using MD5-hashed filenames and parameters (\(\text{WAVELET\_TYPE}=\)\texttt{'db4'}, \(\text{sample\_size}=2048\)).
+    \end{itemize}
+\end{itemize}
+
+\section{Text-to-Audio Transformer Module}
+
+To translate user prompts into a rich conditioning signal for diffusion, we implement a \texttt{TextToAudioTokenizer}
+\noindent\textbf{Workflow:}
+\begin{enumerate}
+  \item \emph{Embed text} via a pretrained \texttt{text\_to\_embedding} function, adjusted to 512 dimensions.
+  \item \emph{Project} to \(\text{audio\_token\_dim}=256\), expand to a sequence of length \(\text{time\_dim}=64\).
+  \item \emph{Process} through 6 transformer layers (8 heads, FF dim 512), modeling temporal dependencies.
+  \item \emph{Project outputs} to frequency (\(\tanh\)), volume (\(\operatorname{sigmoid}\)), and time-token spaces.
+\end{enumerate}
+
+\noindent\textbf{Integration:}  
+At generation time, the tokenizer’s outputs are passed as a conditioning tensor into the diffusion U-Net (via cross-attention within residual blocks), seeding the reverse diffusion to follow the prompt.
+
+\section{U-Net Diffusion Backbone}
+
+We implement a U-Net with configurable depth and filter dimensions:
+
+\begin{itemize}
+  \item \textbf{Time Embedding}: 1-D input \(\to\) embedding (size 1000\(\times\)256) \(\to\) dense + \texttt{swish}.
+  \item \textbf{Residual Blocks}: Two \(\mathrm{Conv2D}\!+\!\mathrm{BN}\!+\!\mathrm{Swish}\!+\!\mathrm{Dropout}(0.1)\) per level, with identity 1\(\times\)1 skip if channel mismatch.
+  \item \textbf{Down/Up Sampling}: Strided \(\mathrm{Conv2D}\) for encoding; \(\mathrm{Conv2DTranspose}\) for decoding, with symmetric skip connections.
+  \item \textbf{Self-Attention}: Inserted at resolutions specified by \texttt{attention\_res}, implemented via learned \(Q,K,V\) convolutions, scaled dot-product, and residual scaling (0.1), with L2 regularization (\(\lambda=10^{-5}\)) on attention convs.
+\end{itemize}
+
+\section{DiffusionModel Implementation}
+
+The \texttt{DiffusionModel} class computes:
+\[
+\beta_t,\ \alpha_t = 1-\beta_t,\ \bar\alpha_t = \prod_{i=1}^t \alpha_i,
+\]
+with \(\beta\) schedules:
+\begin{itemize}
+  \item \texttt{linear}: \(\beta_t=\mathrm{linspace}(\beta_{\mathrm{start}},\beta_{\mathrm{end}})\).
+  \item \texttt{quadratic}: \(\beta_t=(\mathrm{linspace}(\sqrt{\beta_{\mathrm{start}}},\sqrt{\beta_{\mathrm{end}}}))^2\).
+  \item \texttt{cosine}: improved schedule with offset \(s=0.008\) \cite{NicholDhariwal2021}.
+\end{itemize}
+Forward sampling:
+\[
+x_t = \sqrt{\bar\alpha_t}\,x_0 + \sqrt{1-\bar\alpha_t}\,\epsilon.
+\]
+Posterior variances and coefficients are precomputed in NumPy.
+
+\section{Training Loop}
+
+\begin{itemize}
+  \item \textbf{GPU \& Mixed Precision}: \texttt{tf.config.list\_physical\_devices('GPU')} + memory growth; global policy \texttt{mixed\_float16}.
+  \item \textbf{Distribution Strategy}: \texttt{tf.distribute.MirroredStrategy} for multi-GPU.
+  \item \textbf{Gradient Accumulation}: Accumulate over \(\text{num\_accumulations}\) to simulate larger batch sizes.
+  \item \textbf{Clipping \& Optimization}: Global norm clip, Adam optimizer with \texttt{CosineDecay} (initial \(1\times10^{-5}\), decay steps \(=\!\text{epochs}\times(\lvert\mathcal D\rvert/\text{batch\_size})\)).
+  \item \textbf{EMA}: Exponential moving average on weights for stability.
+  \item \textbf{Checkpointing}: Save \texttt{diffusion\_model} and \texttt{diffusion\_params.json} (containing \(\beta\), \(\alpha\), \(\bar\alpha\) arrays).
+\end{itemize}
+
+\chapter{Generation Pipeline}
+
+\begin{enumerate}
+  \item \textbf{Text Conditioning}:  
+    \begin{itemize}
+      \item Optionally call \\ \texttt{generate\_audio\_from\_text(text, tokenizer\_model\_path,\dots)}  
+      \item Internally: embed text $\to$ tokenizer $\to$ conditioning tokens.
+    \end{itemize}
+  \item \textbf{Initialize} wavelet-coefficient tensor with Gaussian noise (seedable).
+  \item \textbf{Reverse Diffusion}: for \(T=1000\) timesteps (\(\eta\)-controlled), denoise using the U-Net conditioned on both time and text tokens.
+  \item \textbf{Inverse DWT}: \texttt{pywt.idwt} reconstructs waveform.
+  \item \textbf{Save Audio}: write \texttt{.wav} at desired sample rate.
+\end{enumerate}
+
+\chapter{Experiments and Training}
+
+\section{Dataset}
+For all experiments, we curated a custom dataset of approximately 54 minutes (≈1 GB) of raw, uncompressed WAV recordings of original metal songs. Audio was sampled at 48 kHz and segmented into 2048-sample frames, yielding:
+\[
+\frac{54 \times 60 \times 48000}{2048} \approx 7.57\times10^4\ \text{segments}.
+\]
+Each segment was wavelet-decomposed and cached for efficient loading.
+
+\section{Training Setup}
+The DWT model was trained end-to-end-including both diffusion U-Net and text-to-audio tokenizer conditioning-for a total of 50 hours on a single GPU with mixed-precision enabled. Key hyperparameters were:
+\begin{itemize}
+  \item \textbf{Timesteps ($T$)}: 1000 (cosine schedule)
+  \item \textbf{Batch size}: 16 (with gradient accumulation to simulate effective batch size of 64)
+  \item \textbf{Epochs}: 100 over the full dataset
+  \item \textbf{Optimizer}: Adam with cosine-decay LR (initial $1\times10^{-5}$)
+  \item \textbf{EMA decay}: 0.9999
+  \item \textbf{Dropout}: 0.1 in residual blocks
+\end{itemize}
+Training progressed at roughly 1 epoch per 30 minutes, for a total of 50 hours to converge on stable audio samples.
+
+\section{Results}
+Qualitative listening tests on held-out prompts of metal riffs indicate:
+\begin{itemize}
+  \item \emph{Phase coherence} significantly improved versus STFT‐based baselines.
+  \item \emph{Low/high frequency fidelity} is preserved without noticeable ringing.
+  \item \emph{Prompt adherence} is strong when using the text-to-audio transformer conditioning.
+\end{itemize}
+Quantitative evaluation (e.g.\ spectral convergence, PESQ) is ongoing and will be reported in future work.
+
+\chapter{Conclusion}
+
+We have detailed a production-grade DWT model that leverages multi-resolution wavelets, diffusion denoising, and transformer conditioning to generate high-fidelity music from text prompts. Future work includes psychoacoustic evaluations, real-time synthesis, and expanding the text tokenizer with larger language models.
+
+\begin{thebibliography}{99}
+
+\bibitem{Goodfellow2014}
+I.~J. Goodfellow et~al., “Generative Adversarial Networks,” 2014, \url{https://arxiv.org/abs/1406.2661}.
+
+\bibitem{ForsgrenMartiros2022}
+S. Forsgren and H. Martiros, “Riffusion – Stable diffusion for real‐time music generation,” 2022, \url{https://riffusion.com/about}.
+
+\bibitem{Rombach2022}
+R. Rombach et~al., “High‐Resolution Image Synthesis With Latent Diffusion Models,” 2022, \url{https://arxiv.org/abs/2112.10752}.
+
+\bibitem{Daubechies1988}
+I.~Daubechies, “Orthonormal bases of compactly supported wavelets,”
+  \emph{Commun. Pure Appl. Math.}, vol.~41, no.~7, pp. 909--996, 1988. :contentReference[oaicite:0]{index=0}
+
+\bibitem{Mallat1989}
+S.~Mallat, “A theory for multiresolution signal decomposition: The wavelet
+  representation,” \emph{IEEE Trans. Pattern Anal. Mach. Intell.}, vol.~11,
+  no.~7, pp. 674--693, Jul.\ 1989. :contentReference[oaicite:1]{index=1}
+
+\bibitem{Tzanetakis2001}
+G.~Tzanetakis, G.~Essl, and P.~Cook, “Audio analysis using the discrete
+  wavelet transform,” in \emph{Proc.\ AMTA}, 2001.
+
+\bibitem{PyWaveletsDoc}
+“Discrete wavelet transform — PyWavelets documentation,” 2025,
+  \url{https://pywavelets.readthedocs.io/}. 
+
+\bibitem{Ho2020}
+J.~Ho, A.~Jain, and P.~Abbeel, “Denoising diffusion probabilistic models,”
+  \emph{arXiv:2006.11239}, 2020. 
+
+\bibitem{NicholDhariwal2021}
+A.~Q. Nichol and P.~Dhariwal, “Improved denoising diffusion probabilistic
+  models,” in \emph{Proc.\ ICLR}, 2021. 
+
+\bibitem{Vaswani2017}
+A.~Vaswani \emph{et~al.}, “Attention is all you need,” in \emph{Proc.\ NeurIPS},
+  2017. 
+
+\bibitem{Agostinelli2023}
+A.~Agostinelli \emph{et~al.}, “MusicLM: Generating music from text,”
+  \emph{arXiv:2301.11325}, 2023. 
+
+\end{thebibliography}
+
+\end{document}
