@@ -766,8 +766,8 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             logger.info(f"모델 저장됨: checkpoints/diffusion_model_epoch_{epoch+1}.keras")
     
     # 최종 모델 저장
-    model.save('diffusion_model')
-    logger.info("최종 모델 저장됨: diffusion_model")
+    model.save('diffusion_model.keras')
+    logger.info("최종 모델 저장됨: diffusion_model.keras")
     
     # 디퓨전 파라미터 저장
     diffusion_params = {
@@ -876,7 +876,7 @@ def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0, num_sample
     
     return tf.convert_to_tensor(x_result, dtype=tf.float32)
 
-def load_model(model_path='diffusion_model'):
+def load_model(model_path='diffusion_model.keras'):
     """모델 로드 함수"""
     custom_objects = {
         'Sampling': Sampling,
@@ -1060,7 +1060,7 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None, t
     # 모델 로드
     try:
         keras.config.enable_unsafe_deserialization()
-        model = keras.models.load_model('diffusion_model')
+        model = keras.models.load_model('diffusion_model.keras')
         logger.info("모델 로드 성공")
     except Exception as e:
         logger.error(f"모델 로드 실패: {str(e)}")
@@ -1120,8 +1120,8 @@ def generate_from_text(text_description, output_path='generated_from_text.wav', 
     """텍스트 설명에서 오디오 생성"""
     # 텍스트-오디오 변환 모듈 가져오기
     try:
-        from diffusion_text import combined_text_audio
-        seeds = combined_text_audio(text_description)
+        from diffusion_text import generate_audio_seeds
+        seeds = generate_audio_seeds(text_description)
         if seeds is not None:
             logger.info(f"텍스트 기반 오디오 생성 시작: '{text_description}'")
             return generate_audio(output_path=output_path, steps=steps, eta=eta, seed=seeds[0], text_description=text_description)
@@ -1196,7 +1196,7 @@ if __name__ == '__main__':
         eta = float(sys.argv[5]) if len(sys.argv) > 5 else 30
         
         logger.info(f"텍스트 기반 생성 시작: '{text}'")
-        result = generate_audio_from_text(text, tokenizer_model_path='text_to_audio_model', diffusion_model_path='diffusion_model', output_path=output_path, steps=steps, eta=eta)
+        result = generate_audio_from_text(text, tokenizer_model_path='text_to_audio_model', diffusion_model_path='diffusion_model.keras', output_path=output_path, steps=steps, eta=eta)
         
         if result:
             logger.info(f"텍스트 기반 생성 완료: {result['path']}")

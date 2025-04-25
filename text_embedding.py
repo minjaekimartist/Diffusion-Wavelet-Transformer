@@ -5,7 +5,7 @@ def setup_embedding_model():
     """텍스트 임베딩 모델 설정"""
     try:
         # 다국어 지원 텍스트 임베딩 모델
-        model = SentenceTransformer('distiluse-base-multilingual-cased-v1', device='cpu')
+        model = SentenceTransformer('distiluse-base-multilingual-cased-v1')
         print("텍스트 임베딩 모델 로드 성공")
     except Exception as e:
         print(f"오류: {e}")

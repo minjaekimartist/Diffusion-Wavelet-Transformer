@@ -9,7 +9,7 @@ import random
 from tqdm import tqdm
 from text_embedding import adjust_embedding_dimension, setup_embedding_model, text_to_embedding
 
-@keras.saving.register_keras_serializable(package="wavelet_music")
+@keras.saving.register_keras_serializable(package="DiffusionWaveletTransformer")
 class TransformerDenoiser(keras.Model):
     def __init__(self, embed_dim=512):
         super(TransformerDenoiser, self).__init__()
@@ -78,7 +78,7 @@ class TransformerDenoiser(keras.Model):
         # 두 번째 스킵 연결
         return x + x3
 
-@keras.saving.register_keras_serializable(package="wavelet_music")
+@keras.saving.register_keras_serializable(package="DiffusionWaveletTransformer")
 class AudioDiffusionConditioner(keras.Model):
     """텍스트 임베딩을 오디오 디퓨전 모델의 입력으로 변환하는 조건부 모델"""
     
@@ -466,31 +466,6 @@ def generate_audio_seeds(text_input: str, conditioner_path="audio_conditioner", 
     
     return seeds
 
-def combined_text_audio(text_input: str, 
-                      text_model_path="music_fact_generator",
-                      audio_model_path="text_to_audio_model",
-                      diffusion_model_path="diffusion_model",
-                      output_path="generated.wav",
-                      steps=10):
-    """텍스트와 오디오 생성 통합 함수"""
-    print(f"입력 텍스트: {text_input}")
-    
-    # 1. 텍스트 기반 음악 사실 생성
-    generated_fact = generate(text_input, model_path=text_model_path, steps=steps)
-    print(f"생성된 음악 사실: {generated_fact}")
-    
-    # 2. 오디오 시드 생성
-    seeds = generate_audio_seeds(generated_fact, num_seeds=1)
-    
-    # 오디오 시드가 None인 경우 처리 추가
-    if seeds is None:
-        print("오디오 시드 생성 실패")
-        return {
-            'text': generated_fact,
-            'error': "오디오 시드 생성 실패, 조건부 모델을 로드할 수 없습니다."
-        }
-    return seeds
-
 if __name__ == "__main__":
     reference_texts = []
     reference_embeddings = None
@@ -537,12 +512,6 @@ if __name__ == "__main__":
                 sys.exit(1)
             else:
                 text_input = sys.argv[2]
-            
-            try:
-                output = combined_text_audio(text_input)
-            except Exception as e:
-                print(f"생성 중 오류 발생: {e}")
-                sys.exit(1)
         else:
             print("알 수 없는 명령: " + sys.argv[1])
             print("사용법: python diffusion_text.py [train|generate] [TEXT(optional)]")
