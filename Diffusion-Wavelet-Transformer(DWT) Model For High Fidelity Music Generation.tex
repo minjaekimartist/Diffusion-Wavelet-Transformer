@@ -30,7 +30,7 @@ Generative adversarial networks (GANs) pioneered deep generative modeling for au
 \chapter{Background}
 
 \section{Wavelet Transforms in Audio}
-Discrete wavelet transforms (DWT) provide a multi‐resolution decomposition of a signal into approximation and detail coefficients, yielding higher frequency resolution at low bands and better time resolution at high bands.  The mathematical framework of multiresolution analysis (MRA) was formalized by Mallat, who showed how to implement the DWT efficiently via a pyramidal filter‐bank algorithm \cite{Mallat1989}.  Daubechies then constructed the first family of \emph{compactly supported} orthonormal wavelets-now known as Daubechies “db$N$” wavelets-which admit fast, finite-impulse-response implementation and excellent regularity properties \cite{Daubechies1988}.  We use the ‘db4’ variant for its balance of time-frequency localization in audio.
+Discrete wavelet transforms (DWT) provide a multi-resolution decomposition of a signal into approximation and detail coefficients, yielding higher frequency resolution at low bands and better time resolution at high bands.  The mathematical framework of multiresolution analysis (MRA) was formalized by Mallat, who showed how to implement the DWT efficiently via a pyramidal filter-bank algorithm \cite{Mallat1989}.  Daubechies then constructed the first family of \emph{compactly supported} orthonormal wavelets-now known as Daubechies “db$N$” wavelets-which admit fast, finite-impulse-response implementation and excellent regularity properties \cite{Daubechies1988}.  We use the ‘db4’ variant for its balance of time-frequency localization in audio.
 \section{Diffusion Models}
 Denoising Diffusion Probabilistic Models (DDPM) define a forward noising and reverse denoising process \cite{Ho2020}. Improved cosine noise schedules-with small offset $s=0.008$-achieve smoother sample trajectories \cite{NicholDhariwal2021}.
 
@@ -151,7 +151,7 @@ Training progressed at roughly 1 epoch per 30 minutes, for a total of 50 hours t
 \section{Results}
 Qualitative listening tests on held-out prompts of metal riffs indicate:
 \begin{itemize}
-  \item \emph{Phase coherence} significantly improved versus STFT‐based baselines.
+  \item \emph{Phase coherence} significantly improved versus STFT-based baselines.
   \item \emph{Low/high frequency fidelity} is preserved without noticeable ringing.
   \item \emph{Prompt adherence} is strong when using the text-to-audio transformer conditioning.
 \end{itemize}
@@ -167,7 +167,7 @@ We have detailed a production-grade DWT model that leverages multi-resolution wa
 I.~J. Goodfellow et~al., “Generative Adversarial Networks,” 2014, \url{https://arxiv.org/abs/1406.2661}.
 
 \bibitem{ForsgrenMartiros2022}
-S. Forsgren and H. Martiros, “Riffusion – Stable diffusion for real‐time music generation,” 2022, \url{https://riffusion.com/about}.
+S. Forsgren and H. Martiros, “Riffusion - Stable diffusion for real-time music generation,” 2022, \url{https://riffusion.com/about}.
 
 \bibitem{Rombach2022}
 R. Rombach et~al., “High‐Resolution Image Synthesis With Latent Diffusion Models,” 2022, \url{https://arxiv.org/abs/2112.10752}.
