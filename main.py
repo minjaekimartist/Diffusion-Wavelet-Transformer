@@ -917,50 +917,55 @@ def inverse_transform(wavelet_data):
                 
             # 데이터 추출 및 형태 확인
             if wavelet_data.ndim == 3:
+                max_allowed_dim = 512  # PyWavelets 안전 한계
+                
                 # 큰 데이터를 작은 청크로 분할 처리
                 cA_full = np.array(wavelet_data[i, 0], dtype=np.float32)
                 cD_full = np.array(wavelet_data[i, 1], dtype=np.float32)
                 
                 # 길이 맞추기
                 min_len = min(len(cA_full), len(cD_full))
-                cA = cA_full[:min_len]
-                cD = cD_full[:min_len]
+                chunk_size = min(max_allowed_dim, len(cA_full))
+                chunk_count = (len(cA_full) + chunk_size - 1) // chunk_size
+                
+                chunks_reconstructed = []
+                for chunk in range(chunk_count):
+                    start = chunk * chunk_size
+                    end = min(start + chunk_size, len(cA_full))
+                    
+                    # 청크 크기 확인
+                    if end - start < 2:
+                        continue  # 너무 작은 청크는 건너뛰기
+                    
+                    # 해당 청크 계수 추출
+                    cA = cA_full[start:end]
+                    cD = cD_full[start:end]
+                    
+                    # NaN 및 무한대 값 대체
+                    cA = np.nan_to_num(cA, nan=0.0, posinf=0.1, neginf=-0.1)
+                    cD = np.clip(cA, -3.0, 3.0)
+                    cD = np.nan_to_num(cD, nan=0.0, posinf=0.1, neginf=-0.1)
+                    cD = np.clip(cD, -3.0, 3.0)
+                    
+                    # 역변환 시도
+                    try:
+                        chunk_reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
+                        if chunk_reconstructed is not None:
+                            chunks_reconstructed.append(chunk_reconstructed)
+                    except Exception as e:
+                        logger.warning(f"청크 {chunk} 역변환 실패: {e}")
+                
+                # 모든 청크 결합
+                if chunks_reconstructed:
+                    reconstructed = np.concatenate(chunks_reconstructed)
+                    reconstructed = np.clip(reconstructed, -1.0, 1.0)
+                    return reconstructed
+                else:
+                    return None
             else:
                 # 지원되지 않는 형태
                 logger.warning(f"지원되지 않는 데이터 형태: {wavelet_data.shape}")
                 return None
-            
-            # 빈 배열 확인
-            if cA.size == 0 or cD.size == 0:
-                logger.warning(f"세그먼트 {i}에서 빈 계수 발견")
-                return None
-            
-            # NaN 및 무한대 값 대체
-            cA = np.nan_to_num(cA, nan=0.0, posinf=0.1, neginf=-0.1)
-            cD = np.nan_to_num(cD, nan=0.0, posinf=0.1, neginf=-0.1)
-            
-            # 극단값 클리핑
-            cA = np.clip(cA, -3.0, 3.0)
-            cD = np.clip(cD, -3.0, 3.0)
-            
-            # 역변환 시도
-            try:
-                reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
-                
-                # None 체크 추가
-                if reconstructed is None or reconstructed.size == 0:
-                    logger.warning(f"세그먼트 {i}에서 역변환 실패")
-                    return None
-                
-                # 결과 검증 및 클리핑
-                reconstructed = np.nan_to_num(reconstructed, nan=0.0)
-                reconstructed = np.clip(reconstructed, -1.0, 1.0)
-                return reconstructed
-                
-            except Exception as e:
-                logger.error(f"세그먼트 {i}에서 역변환 오류: {str(e)}")
-                return None
-                    
         except Exception as e:
             logger.error(f"세그먼트 처리 중 오류: {str(e)}")
             return None
@@ -1106,7 +1111,12 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     
     # 웨이블릿 역변환
     logger.info("웨이블릿 역변환 시작")
-    audio_samples = inverse_transform(generated.numpy())
+    try:
+        audio_samples = inverse_transform(generated.numpy())
+    except Exception as e:
+        logger.error(f"역변환 중 오류 발생: {e}")
+        raise e
+    
     logger.info(f"역변환 완료 (샘플 수: {len(audio_samples)})")
     
     # 오디오 저장
@@ -1158,8 +1168,8 @@ if __name__ == '__main__':
         train(source_path, timesteps=steps, epochs=epochs, batch_size=batch_size, beta_schedule=beta_schedule)
     elif sys.argv[1] == 'generate':
         output_path = sys.argv[2] if len(sys.argv) > 2 else 'generated.wav'
-        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 100
-        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 30
+        steps = int(sys.argv[3]) if len(sys.argv) > 3 else 50
+        eta = float(sys.argv[4]) if len(sys.argv) > 4 else 0.3
         seed = int(sys.argv[5]) if len(sys.argv) > 5 else None
         
         logger.info(f"생성 시작: {output_path}, steps={steps}, eta={eta}, seed={seed}")
@@ -1177,8 +1187,8 @@ if __name__ == '__main__':
             
         text = sys.argv[2]
         output_path = sys.argv[3] if len(sys.argv) > 3 else 'generated_from_text.wav'
-        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 30
+        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 50
+        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 0.3
         
         logger.info(f"텍스트 기반 생성 시작: '{text}'")
         result = generate_from_text(text, output_path=output_path, steps=steps, eta=eta)
@@ -1196,8 +1206,8 @@ if __name__ == '__main__':
             
         text = sys.argv[2]
         output_path = sys.argv[3] if len(sys.argv) > 3 else 'generated_from_text.wav'
-        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 100
-        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 30
+        steps = int(sys.argv[4]) if len(sys.argv) > 4 else 50
+        eta = float(sys.argv[5]) if len(sys.argv) > 5 else 0.3
         
         logger.info(f"텍스트 기반 생성 시작: '{text}'")
         result = generate_audio_from_text(text, tokenizer_model_path='text_to_audio_model', diffusion_model_path='diffusion_model.keras', output_path=output_path, steps=steps, eta=eta)
