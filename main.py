@@ -660,7 +660,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         
         # 옵티마이저 및 학습률 스케줄러 설정
         lr_schedule = keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=1e-5,
+            initial_learning_rate=1e-6,
             decay_steps=epochs * (len(data) // batch_size),
             alpha=0.01
         )
@@ -682,7 +682,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             batch_data = tf.cast(batch_data, tf.float16)
             
             accumulated_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
-            num_accumulations = 64  # 64번 누적 (가상 배치 크기 = 64 * batch_size)
+            num_accumulations = 16  # 16번 누적 (가상 배치 크기 = 16 * batch_size)
             grad_norm_clip = 1.0
             total_loss = 0.0
             
@@ -717,6 +717,11 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                         noise = tf.cast(noise, predicted_noise.dtype)
                         
                     loss = tf.reduce_mean(tf.square(noise - predicted_noise)) / num_accumulations
+                    if tf.math.is_nan(loss):
+                        tf.print("경고: NaN 손실 발생!")
+                    elif tf.math.is_inf(loss):
+                        tf.print("경고: 무한대 손실 발생!")
+                    loss = tf.clip_by_value(loss, 0, 1e6)
                     total_loss += loss * num_accumulations
                 
                 # 그래디언트 계산 및 누적
@@ -1048,7 +1053,7 @@ def normalize_audio(samples, target_peak=0.9):
             
     return samples
 
-def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None, text_description=None):
+def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     """오디오 생성 함수"""
     logger.info(f"오디오 생성 시작: {output_path}")
     
@@ -1059,8 +1064,7 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None, t
     
     # 모델 로드
     try:
-        keras.config.enable_unsafe_deserialization()
-        model = keras.models.load_model('diffusion_model.keras')
+        model = keras.models.load_model('diffusion_model.keras', compile=False)
         logger.info("모델 로드 성공")
     except Exception as e:
         logger.error(f"모델 로드 실패: {str(e)}")
