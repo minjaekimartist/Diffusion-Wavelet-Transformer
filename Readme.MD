@@ -16,3 +16,11 @@ python main.py generate \[output_path\] \[steps\] \[eta\] \[seed\]
 # generate with text and parameters
 python main.py text2audio \[text\] \[output_path\] \[steps\] \[eta\]
 ```
+@misc{Kim2025Diffusion,
+      title={Diffusion-Wavelet-Transformer (DWT) Model for High-Fidelity Music Generation}, 
+      author={Minjae Kim},
+      year={2025},
+      eprint={},
+      archivePrefix={arXiv},
+      primaryClass={cs.ML}
+}
