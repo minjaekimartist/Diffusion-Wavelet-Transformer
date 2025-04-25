@@ -766,8 +766,8 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             logger.info(f"모델 저장됨: checkpoints/diffusion_model_epoch_{epoch+1}.keras")
     
     # 최종 모델 저장
-    model.save('diffusion_model.keras')
-    logger.info("최종 모델 저장됨: diffusion_model.keras")
+    model.save('diffusion_model')
+    logger.info("최종 모델 저장됨: diffusion_model")
     
     # 디퓨전 파라미터 저장
     diffusion_params = {
@@ -876,7 +876,7 @@ def sample_from_diffusion(model, diffusion, shape, steps=1000, eta=0, num_sample
     
     return tf.convert_to_tensor(x_result, dtype=tf.float32)
 
-def load_model(model_path='diffusion_model.keras'):
+def load_model(model_path='diffusion_model'):
     """모델 로드 함수"""
     custom_objects = {
         'Sampling': Sampling,
@@ -1060,7 +1060,7 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None, t
     # 모델 로드
     try:
         keras.config.enable_unsafe_deserialization()
-        model = keras.models.load_model('diffusion_model.keras')
+        model = keras.models.load_model('diffusion_model')
         logger.info("모델 로드 성공")
     except Exception as e:
         logger.error(f"모델 로드 실패: {str(e)}")
