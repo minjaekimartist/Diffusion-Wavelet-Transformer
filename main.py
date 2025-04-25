@@ -213,8 +213,8 @@ class Data:
                 cA, cD = pywt.dwt(segment, WAVELET_TYPE)
                 
                 # 정규화 추가
-                cA = (cA - np.mean(cA)) / (np.std(cA) + 1e-8)
-                cD = (cD - np.mean(cD)) / (np.std(cD) + 1e-8)
+                cA = (cA - np.mean(cA)) / (np.std(cA) + 1e-7)
+                cD = (cD - np.mean(cD)) / (np.std(cD) + 1e-7)
                 
                 if np.any(np.isnan(cA)) or np.any(np.isnan(cD)):
                     return None
@@ -369,7 +369,7 @@ class DiffusionModel:
         if loss_type == "l1":
             loss = tf.reduce_mean(tf.abs(noise - predicted_noise))
         elif loss_type == "huber":
-            loss = tf.keras.losses.Huber(delta=0.1)(noise, predicted_noise)
+            loss = tf.keras.losses.Huber(delta=1.0)(noise, predicted_noise)
         else:  # l2
             loss = tf.reduce_mean(tf.square(noise - predicted_noise))
             
@@ -456,11 +456,11 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
         
         # 레지듀얼 블록
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h)
-        h_res = keras.layers.BatchNormalization()(h_res)
+        h_res = keras.layers.BatchNormalization(epsilon=1e-5)(h_res)
         h_res = keras.layers.Activation('swish')(h_res)
         h_res = keras.layers.Dropout(0.1)(h_res)  # 10% 드롭아웃
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h_res)
-        h_res = keras.layers.BatchNormalization()(h_res)
+        h_res = keras.layers.BatchNormalization(epsilon=1e-5)(h_res)
         
         # 입력 채널 수와 출력 채널 수가 다를 수 있으므로 1x1 컨볼루션으로 맞춤
         if h.shape[-1] != filters:
@@ -478,7 +478,7 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
         # 다운샘플링
         if i < depth - 1:  # 마지막 블록에서는 다운샘플링 없음
             h = keras.layers.Conv2D(filters * 2, 3, strides=2, padding='same')(h)
-            h = keras.layers.BatchNormalization()(h)
+            h = keras.layers.BatchNormalization(epsilon=1e-5)(h)
             h = keras.layers.Activation('swish')(h)
     
     # 디코더 부분 (업샘플링)
@@ -488,7 +488,7 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
         # 업샘플링
         if i < depth - 1:  # 첫 번째 블록에서는 업샘플링 없음
             h = keras.layers.Conv2DTranspose(filters, 3, strides=2, padding='same')(h)
-            h = keras.layers.BatchNormalization()(h)
+            h = keras.layers.BatchNormalization(epsilon=1e-5)(h)
             h = keras.layers.Activation('swish')(h)
         
         # 스킵 연결 전에 크기 조정
@@ -509,10 +509,10 @@ def build_unet_model(input_shape, time_embedding_dim=64, base_filters=32, depth=
         
         # 레지듀얼 블록
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h)
-        h_res = keras.layers.BatchNormalization()(h_res)
+        h_res = keras.layers.BatchNormalization(epsilon=1e-5)(h_res)
         h_res = keras.layers.Activation('swish')(h_res)
         h_res = keras.layers.Conv2D(filters, 3, padding='same')(h_res)
-        h_res = keras.layers.BatchNormalization()(h_res)
+        h_res = keras.layers.BatchNormalization(epsilon=1e-5)(h_res)
         
         # 입력과 출력 채널 수가 다를 수 있으므로 1x1 컨볼루션으로 맞춤
         h_skip = keras.layers.Conv2D(filters, 1, padding='same')(h)
@@ -653,9 +653,9 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
         model = build_unet_model(
             input_shape=input_shape, 
             time_embedding_dim=256, 
-            base_filters=128, 
-            depth=5, 
-            attention_res=[1, 2, 3, 4]
+            base_filters=64, 
+            depth=4, 
+            attention_res=[1, 2, 3]
         )
         
         # 옵티마이저 및 학습률 스케줄러 설정
@@ -672,7 +672,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             ema_momentum=0.999  # EMA 사용 (더 안정적인 가중치)
         )
 
-        model.compile(optimizer=optimizer, loss='mse')
+        model.compile(optimizer=optimizer, loss='huber')
     
         # 모델 요약 출력
         model.summary()
@@ -683,7 +683,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             
             accumulated_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
             num_accumulations = 16  # 16번 누적 (가상 배치 크기 = 16 * batch_size)
-            grad_norm_clip = 1.0
+            grad_norm_clip = 0.5
             total_loss = 0.0
             
             # 그래디언트 누적
@@ -716,7 +716,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                     if noise.dtype != predicted_noise.dtype:
                         noise = tf.cast(noise, predicted_noise.dtype)
                         
-                    loss = tf.reduce_mean(tf.square(noise - predicted_noise)) / num_accumulations
+                    loss = tf.keras.losses.Huber(delta=0.1)(noise, predicted_noise) / num_accumulations
                     if tf.math.is_nan(loss):
                         tf.print("경고: NaN 손실 발생!")
                     elif tf.math.is_inf(loss):
@@ -917,55 +917,50 @@ def inverse_transform(wavelet_data):
                 
             # 데이터 추출 및 형태 확인
             if wavelet_data.ndim == 3:
-                max_allowed_dim = 512  # PyWavelets 안전 한계
-                
                 # 큰 데이터를 작은 청크로 분할 처리
                 cA_full = np.array(wavelet_data[i, 0], dtype=np.float32)
                 cD_full = np.array(wavelet_data[i, 1], dtype=np.float32)
                 
                 # 길이 맞추기
                 min_len = min(len(cA_full), len(cD_full))
-                chunk_size = min(max_allowed_dim, len(cA_full))
-                chunk_count = (len(cA_full) + chunk_size - 1) // chunk_size
-                
-                chunks_reconstructed = []
-                for chunk in range(chunk_count):
-                    start = chunk * chunk_size
-                    end = min(start + chunk_size, len(cA_full))
-                    
-                    # 청크 크기 확인
-                    if end - start < 2:
-                        continue  # 너무 작은 청크는 건너뛰기
-                    
-                    # 해당 청크 계수 추출
-                    cA = cA_full[start:end]
-                    cD = cD_full[start:end]
-                    
-                    # NaN 및 무한대 값 대체
-                    cA = np.nan_to_num(cA, nan=0.0, posinf=0.1, neginf=-0.1)
-                    cD = np.clip(cA, -3.0, 3.0)
-                    cD = np.nan_to_num(cD, nan=0.0, posinf=0.1, neginf=-0.1)
-                    cD = np.clip(cD, -3.0, 3.0)
-                    
-                    # 역변환 시도
-                    try:
-                        chunk_reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
-                        if chunk_reconstructed is not None:
-                            chunks_reconstructed.append(chunk_reconstructed)
-                    except Exception as e:
-                        logger.warning(f"청크 {chunk} 역변환 실패: {e}")
-                
-                # 모든 청크 결합
-                if chunks_reconstructed:
-                    reconstructed = np.concatenate(chunks_reconstructed)
-                    reconstructed = np.clip(reconstructed, -1.0, 1.0)
-                    return reconstructed
-                else:
-                    return None
+                cA = cA_full[:min_len]
+                cD = cD_full[:min_len]
             else:
                 # 지원되지 않는 형태
                 logger.warning(f"지원되지 않는 데이터 형태: {wavelet_data.shape}")
                 return None
+            
+            # 빈 배열 확인
+            if cA.size == 0 or cD.size == 0:
+                logger.warning(f"세그먼트 {i}에서 빈 계수 발견")
+                return None
+            
+            # NaN 및 무한대 값 대체
+            cA = np.nan_to_num(cA, nan=0.0, posinf=0.1, neginf=-0.1)
+            cD = np.nan_to_num(cD, nan=0.0, posinf=0.1, neginf=-0.1)
+            
+            # 극단값 클리핑
+            cA = np.clip(cA, -3.0, 3.0)
+            cD = np.clip(cD, -3.0, 3.0)
+            
+            # 역변환 시도
+            try:
+                reconstructed = pywt.idwt(cA, cD, WAVELET_TYPE)
+                
+                # None 체크 추가
+                if reconstructed is None or reconstructed.size == 0:
+                    logger.warning(f"세그먼트 {i}에서 역변환 실패")
+                    return None
+                
+                # 결과 검증 및 클리핑
+                reconstructed = np.nan_to_num(reconstructed, nan=0.0)
+                reconstructed = np.clip(reconstructed, -1.0, 1.0)
+                return reconstructed
+                
+            except Exception as e:
+                logger.error(f"세그먼트 {i}에서 역변환 오류: {str(e)}")
+                return None
+                    
         except Exception as e:
             logger.error(f"세그먼트 처리 중 오류: {str(e)}")
             return None
@@ -1073,6 +1068,8 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
         logger.info("모델 로드 성공")
     except Exception as e:
         logger.error(f"모델 로드 실패: {str(e)}")
+        with open('log.txt', 'w') as log_file:
+            log_file.write(f"모델 로드 실패: {str(e)}\n")
         return None
     
     # 디퓨전 파라미터 로드
@@ -1111,12 +1108,7 @@ def generate_audio(output_path='generated.wav', steps=100, eta=0.3, seed=None):
     
     # 웨이블릿 역변환
     logger.info("웨이블릿 역변환 시작")
-    try:
-        audio_samples = inverse_transform(generated.numpy())
-    except Exception as e:
-        logger.error(f"역변환 중 오류 발생: {e}")
-        raise e
-    
+    audio_samples = inverse_transform(generated.numpy())
     logger.info(f"역변환 완료 (샘플 수: {len(audio_samples)})")
     
     # 오디오 저장
