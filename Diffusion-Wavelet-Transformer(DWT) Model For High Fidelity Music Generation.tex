@@ -55,7 +55,7 @@ Transformers capture long-range dependencies via self-attention \cite{Vaswani201
     \]
   \item \textbf{Caching \& Parallelization}:  
     \begin{itemize}
-      \item \emph{File‐level} and \emph{folder‐level} caching using MD5-hashed filenames and parameters (\(\text{WAVELET\_TYPE}=\)\texttt{'db4'}, \(\text{sample\_size}=2048\)).
+      \item \emph{File-level} and \emph{folder-level} caching using MD5-hashed filenames and parameters (\(\text{WAVELET\_TYPE}=\)\texttt{'db4'}, \(\text{sample\_size}=2048\)).
     \end{itemize}
 \end{itemize}
 
@@ -130,9 +130,9 @@ Posterior variances and coefficients are precomputed in NumPy.
 \chapter{Experiments and Training}
 
 \section{Dataset}
-For all experiments, we curated a custom dataset of approximately 54 minutes (≈1 GB) of raw, uncompressed WAV recordings of original metal songs. Audio was sampled at 48 kHz and segmented into 2048-sample frames, yielding:
+For all experiments, we curated a custom dataset of approximately 3 Hours (≈3 GB) of raw, uncompressed WAV recordings of original metal songs. Audio was sampled at 48 kHz and segmented into 2048-sample frames, yielding:
 \[
-\frac{54 \times 60 \times 48000}{2048} \approx 7.57\times10^4\ \text{segments}.
+\frac{3 \times 60 \times 60 \times 48000}{2048} \approx 2.53\times10^5\ \text{segments}.
 \]
 Each segment was wavelet-decomposed and cached for efficient loading.
 
@@ -140,7 +140,7 @@ Each segment was wavelet-decomposed and cached for efficient loading.
 The DWT model was trained end-to-end-including both diffusion U-Net and text-to-audio tokenizer conditioning-for a total of 50 hours on a single GPU with mixed-precision enabled. Key hyperparameters were:
 \begin{itemize}
   \item \textbf{Timesteps ($T$)}: 1000 (cosine schedule)
-  \item \textbf{Batch size}: 16 (with gradient accumulation to simulate effective batch size of 64)
+  \item \textbf{Batch size}: 256 (with gradient accumulation to simulate effective batch size of 2048)
   \item \textbf{Epochs}: 100 over the full dataset
   \item \textbf{Optimizer}: Adam with cosine-decay LR (initial $1\times10^{-5}$)
   \item \textbf{EMA decay}: 0.9999

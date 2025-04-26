@@ -682,7 +682,7 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
             batch_data = tf.cast(batch_data, tf.float16)
             
             accumulated_gradients = [tf.zeros_like(var) for var in model.trainable_variables]
-            num_accumulations = 16  # 16번 누적 (가상 배치 크기 = 16 * batch_size)
+            num_accumulations = 8  # 8번 누적 (가상 배치 크기 = 8 * batch_size)
             grad_norm_clip = 0.5
             total_loss = 0.0
             
@@ -716,7 +716,12 @@ def train(folder: str, timesteps=1000, epochs=100, batch_size=16, beta_schedule=
                     if noise.dtype != predicted_noise.dtype:
                         noise = tf.cast(noise, predicted_noise.dtype)
                         
-                    loss = tf.keras.losses.Huber(delta=0.1)(noise, predicted_noise) / num_accumulations
+                    loss = tf.keras.losses.Huber(
+                        delta=0.1, 
+                        reduction=tf.keras.losses.Reduction.NONE
+                    )(noise, predicted_noise)
+                    loss = tf.reduce_mean(loss) / num_accumulations
+                    
                     if tf.math.is_nan(loss):
                         tf.print("경고: NaN 손실 발생!")
                     elif tf.math.is_inf(loss):
