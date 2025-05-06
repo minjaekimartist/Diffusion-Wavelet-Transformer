@@ -10,11 +10,11 @@ source venv/bin/activate
 # install required dependency
 pip install -r requirements.txt
 # train with parameters
-python main.py train \[source_path\] \[timesteps\] \[epochs\] \[batch_size\] \[beta_schedule\]
+python main.py train [source_path] [timesteps] [epochs] [batch_size] [beta_schedule]
 # generate with parameters
-python main.py generate \[output_path\] \[steps\] \[eta\] \[seed\]
+python main.py generate [output_path] [steps] [eta] [seed]
 # generate with text and parameters
-python main.py text2audio \[text\] \[output_path\] \[steps\] \[eta\]
+python main.py text2audio [text] [output_path] [steps] [eta]
 ```
 @misc{Kim2025Diffusion,
       title={Diffusion-Wavelet-Transformer (DWT) Model for High-Fidelity Music Generation}, 
